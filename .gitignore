@@ -15,5 +15,6 @@ env/
 
 # Data files (Ignore large datasets to prevent upload errors)
 *.csv
-data/
+data/*
+!data/metadata_registry.json
 results/
