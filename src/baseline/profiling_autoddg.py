@@ -12,7 +12,6 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict, Any
 
-
 def infer_column_profile(series: pd.Series, max_examples: int = 5) -> Dict[str, Any]:
     col = series.dropna()
 
@@ -27,18 +26,31 @@ def infer_column_profile(series: pd.Series, max_examples: int = 5) -> Dict[str, 
 
     stats = {}
     if coarse_type == "numeric":
-        desc = col.describe(percentiles=[0.25, 0.5, 0.75])
-        stats = {
-            "min": float(desc["min"]),
-            "max": float(desc["max"]),
-            "mean": float(desc["mean"]),
-            "std": float(desc.get("std", 0)),
-            "p25": float(desc["25%"]),
-            "p50": float(desc["50%"]),
-            "p75": float(desc["75%"]),
-        }
+        try:
+            desc = col.describe(percentiles=[0.25, 0.5, 0.75])
+            stats = {
+                "min": float(desc.get("min", float("nan"))),
+                "max": float(desc.get("max", float("nan"))),
+                "mean": float(desc.get("mean", float("nan"))),
+                "std": float(desc.get("std", 0)),
+                "p25": float(desc.get("25%", float("nan"))),
+                "p50": float(desc.get("50%", float("nan"))),
+                "p75": float(desc.get("75%", float("nan"))),
+            }
+        except Exception:
+            stats = {
+                "min": None,
+                "max": None,
+                "mean": None,
+                "std": None,
+                "p25": None,
+                "p50": None,
+                "p75": None,
+            }
+
     elif coarse_type == "datetime":
         stats = {"min": str(col.min()), "max": str(col.max())}
+
     else:
         vc = col.value_counts().head(10)
         stats = {"top_values": [{"value": str(v), "count": int(c)} for v, c in vc.items()]}
@@ -53,7 +65,6 @@ def infer_column_profile(series: pd.Series, max_examples: int = 5) -> Dict[str, 
         "stats": stats,
         "example_values": [str(v) for v in col.head(max_examples)],
     }
-
 
 def profile_dataset(csv_path: Path, dataset_id: str, max_rows=None) -> Dict[str, Any]:
     df = pd.read_csv(csv_path, nrows=max_rows)
