@@ -191,7 +191,6 @@ def run_baseline_autoddg(max_datasets: int | None = None):
             record = {
                 "dataset_id": dataset_id,
                 "title": title,
-                "original_description": description,
                 "topic": topic,
                 "ufd": ufd,
                 "sfd": sfd,
