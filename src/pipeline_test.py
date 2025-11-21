@@ -37,7 +37,7 @@ def run_test_pipeline():
     print("-" * 40)
 
     # --- Stage 1: Download data from NYC Open Data ---
-    print("\n1️⃣  Stage 1: Downloading data from Socrata...")
+    print("\nStage 1: Downloading data from Socrata...")
     client = Socrata("data.cityofnewyork.us", SOCRATA_TOKEN)
     
     # We select an interesting dataset: "Central Park Squirrel Census"
@@ -64,7 +64,7 @@ def run_test_pipeline():
         return
 
     # --- Stage 2: Generate description using Gemini ---
-    print("\n2️⃣  Stage 2: Sending to Gemini for description generation...")
+    print("\nStage 2: Sending to Gemini for description generation...")
     
     # Construct Prompt
     prompt = f"""

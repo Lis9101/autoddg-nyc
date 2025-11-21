@@ -76,7 +76,7 @@ def sync_data_from_registry():
             df = pd.DataFrame.from_records(results)
             
             if df.empty:
-                print("      ⚠️ Warning: Dataset is empty on server.")
+                print("      Warning: Dataset is empty on server.")
                 
             df.to_csv(csv_path, index=False)
             downloaded_count += 1
