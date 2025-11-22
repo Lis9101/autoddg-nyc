@@ -17,7 +17,7 @@ from baseline.llm_client import call_llm
 MAX_SAMPLE_ROWS = 5          # how many rows to show
 MAX_SAMPLE_COLS = 10         # max number of columns to include in the sample
 MAX_COL_CELL_CHARS = 2000    # if a column has cells longer than this, we drop it from the sample
-
+MAX_UFD_PROMPT_CHARS = 60000  # well below llm_client's 120k
 
 def sample_rows(csv_path: Path, n: int = MAX_SAMPLE_ROWS) -> str:
     """
@@ -99,21 +99,49 @@ Applications and Use Cases:
   - bullet list of plausible ways to use this dataset.
 """
 
+MAX_PROFILE_CHARS = 8000   # per JSON block
 
-def generate_ufd(
-    csv_path: Path,
-    content_profile: dict,
-    semantic_profile: dict,
-    topic: str,
-) -> str:
+def _safe_json_block(obj, max_chars=MAX_PROFILE_CHARS, label="profile") -> str:
+    s = json.dumps(obj, ensure_ascii=False)
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars] + f"\n...[{label} truncated at {max_chars} chars]..."
+
+def generate_ufd(csv_path: Path, content_profile: dict, semantic_profile: dict, topic: str) -> str:
+    sample = sample_rows(csv_path)
+    content_json = _safe_json_block(content_profile, label="content_profile")
+    semantic_json = _safe_json_block(semantic_profile, label="semantic_profile")
+
     prompt = UFD_PROMPT.format(
         topic=topic,
-        sample=sample_rows(csv_path),
-        content_profile=json.dumps(content_profile, ensure_ascii=False),
-        semantic_profile=json.dumps(semantic_profile, ensure_ascii=False),
+        sample=sample,
+        content_profile=content_json,
+        semantic_profile=semantic_json,
     )
-    return call_llm(prompt, temperature=0.3)
 
+    # If still too large, first sacrifice the sample, then shrink profiles
+    if len(prompt) > MAX_UFD_PROMPT_CHARS:
+        # 1) Drop sample entirely
+        prompt_no_sample = UFD_PROMPT.format(
+            topic=topic,
+            sample="# Sample omitted due to size limits.\n",
+            content_profile=content_json,
+            semantic_profile=semantic_json,
+        )
+        prompt = prompt_no_sample
+
+    # If STILL huge, shrink JSON blocks further
+    if len(prompt) > MAX_UFD_PROMPT_CHARS:
+        content_json = _safe_json_block(content_profile, max_chars=4000, label="content_profile")
+        semantic_json = _safe_json_block(semantic_profile, max_chars=4000, label="semantic_profile")
+        prompt = UFD_PROMPT.format(
+            topic=topic,
+            sample="# Sample omitted due to size limits.\n",
+            content_profile=content_json,
+            semantic_profile=semantic_json,
+        )
+
+    return call_llm(prompt, temperature=0.3)
 
 def generate_sfd(topic: str, ufd: str) -> str:
     prompt = SFD_PROMPT.format(topic=topic, ufd=ufd)
