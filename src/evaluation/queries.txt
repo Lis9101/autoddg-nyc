@@ -1,0 +1,20 @@
+NYC taxi, for-hire vehicle, or transportation trip statistics
+City employee payroll, overtime, or workforce compensation data
+NYC crime, public safety, or emergency response statistics
+Housing inspections, violations, or landlord-tenant records
+311 service requests or complaint trends across neighborhoods
+Building permits, land use, zoning, or construction activity
+Environmental measurements such as air quality or noise levels
+School performance, enrollment, or educational program data
+Restaurant inspections, food safety, or health violations
+Social services usage, benefits programs, or demographic trends
+Traffic collisions, traffic volume, or street safety indicators
+Parks maintenance, recreation program, or facility inspections
+City budget, financial transparency, or spending reports
+Public transit operations, ridership, or service reliability
+Water usage, infrastructure, sewer, or utility system data
+Business licenses, permits, or economic development records
+Fire department operations, incidents, or inspection results
+Elections, civic engagement, or public participation statistics
+Waste collection, recycling, or sanitation performance metrics
+Public health outcomes, disease surveillance, or hospital data

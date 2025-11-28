@@ -1,0 +1,22 @@
+# System files
+.DS_Store
+
+# Python compiled files and caches
+__pycache__/
+*.pyc
+
+# Virtual Environments
+venv/
+env/
+.venv/
+
+# Environment Variables (Sensitive API Keys - NEVER COMMIT THIS FILE)
+.env
+
+# Data files (Ignore large datasets to prevent upload errors)
+*.csv
+data/*
+!data/metadata_registry.json
+!data/0_baseline_autoddg_descriptions.jsonl
+!data/0_baseline_autoddg_runtime.jsonl
+results/

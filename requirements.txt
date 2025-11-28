@@ -1,0 +1,11 @@
+numpy>=1.26
+pandas>=2.1
+sodapy
+python-dotenv
+tabulate
+google-generativeai>=0.3.0
+
+nltk
+bert-score
+rouge-score
+matplotlib>=3.8

@@ -1,0 +1,44 @@
+{
+  "original": {
+    "lexical_matching_bm25": 0.4291,
+    "completeness": 0.62,
+    "conciseness": 0.73,
+    "readability": 0.83,
+    "faithfulness": 1.0
+  },
+  "hs": {
+    "lexical_matching_bm25": 0.4427,
+    "completeness": 0.762,
+    "conciseness": 0.756,
+    "readability": 0.858,
+    "faithfulness": 1.0
+  },
+  "ufd": {
+    "lexical_matching_bm25": 0.5011,
+    "completeness": 0.842,
+    "conciseness": 0.71,
+    "readability": 0.868,
+    "faithfulness": 0.994
+  },
+  "ufd_nyc": {
+    "lexical_matching_bm25": 0.5011,
+    "completeness": 0.834,
+    "conciseness": 0.71,
+    "readability": 0.868,
+    "faithfulness": 0.994
+  },
+  "sfd": {
+    "lexical_matching_bm25": 0.5928,
+    "completeness": 0.856,
+    "conciseness": 0.722,
+    "readability": 0.858,
+    "faithfulness": 0.982
+  },
+  "sfd_nyc": {
+    "lexical_matching_bm25": 0.5928,
+    "completeness": 0.86,
+    "conciseness": 0.718,
+    "readability": 0.852,
+    "faithfulness": 0.982
+  }
+}
