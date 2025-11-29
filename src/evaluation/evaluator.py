@@ -1,147 +1,145 @@
+"""
+File: src/evaluation/evaluator.py
+Description:
+    Generates a Radar Plot comparing methods.
+    Fixed: Moved 'angles' definition before plotting loop to fix UnboundLocalError.
+"""
+
 import json
 import numpy as np
 import matplotlib.pyplot as plt
+from math import pi
+from pathlib import Path
+
+# ================================================================
+# Path Configuration
+# ================================================================
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+OUTPUTS_DIR = BASE_DIR / "outputs"
+
+NDCG_PATH = OUTPUTS_DIR / "ndcg_eval_results.json"
+TEXT_EVAL_PATH = OUTPUTS_DIR / "text_eval_results.json"
+
+OUTPUT_PLOT_PATH = OUTPUTS_DIR / "eval_radar.png"
+OUTPUT_TABLE_PATH = OUTPUTS_DIR / "eval_results.json"
 
 
-# -----------------------------
-#   Load NDCG JSON
-# -----------------------------
-def load_ndcg(ndcg_path="ndcg_eval_results.json"):
-    with open(ndcg_path, "r", encoding="utf-8") as f:
+# ================================================================
+# Loaders
+# ================================================================
+def load_json(path):
+    if not path.exists():
+        print(f"[WARN] File not found: {path}")
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-
-# -----------------------------
-#   Load text_eval JSONL
-# -----------------------------
-def load_text_eval(path="text_eval_results.jsonl"):
-    records = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                records.append(json.loads(line))
-    return records
-
-
-# -----------------------------
-#   Aggregate text_eval
-# -----------------------------
-def aggregate_text_eval(records):
-    methods = ["original", "hs", "ufd", "ufd_nyc", "sfd", "sfd_nyc"]
-
-    summary = {m: {"completeness": [], "conciseness": [], "readability": [], "faithfulness": []}
-               for m in methods}
-
-    for row in records:
-        for m in methods:
-            ref_free = row.get(m, {}).get("ref_free", {})
-            for k in summary[m]:
-                v = ref_free.get(k)
-                if v is not None:
-                    summary[m][k].append(v)
-
-    # compute mean
-    for m in methods:
-        for k in summary[m]:
-            arr = summary[m][k]
-            summary[m][k] = float(np.mean(arr)) if arr else None
-
-    return summary
-
-
-# -----------------------------
-#   Radar plot
-# -----------------------------
-def make_radar_plot(text_summary, ndcg_summary, out_path="../../outputs/eval_radar.png"):
+# ================================================================
+# Plotting Logic
+# ================================================================
+def make_radar_chart(ndcg_data, text_data):
+    print("-" * 60)
+    print(" Generating Radar Plot...")
+    print("-" * 60)
 
     labels = [
-        "Lexical Matching (BM25)",
-        "Completeness",
-        "Conciseness",
-        "Readability",
-        "Faithfulness"
+        "Search (NDCG)", 
+        "Readability", 
+        "Faithfulness", 
+        "Completeness", 
+        "Conciseness"
     ]
+    N = len(labels)
 
-    def metrics_normalized(method):
-        """Return metrics normalized to [0,1]."""
-        return [
-            ndcg_summary[method]["bm25@20"],                  # Already in 0–1
-            text_summary[method]["completeness"] / 10.0,      # Normalize
-            text_summary[method]["conciseness"] / 10.0,
-            text_summary[method]["readability"] / 10.0,
-            text_summary[method]["faithfulness"] / 10.0,
-        ]
-
-    methods = ["original", "hs", "ufd", "ufd_nyc", "sfd", "sfd_nyc"]
-    method_names = {
-        "original": "Original",
-        "hs": "H&S",
-        "ufd": "UFD",
-        "ufd_nyc": "UFD-NYC",
-        "sfd": "SFD",
-        "sfd_nyc": "SFD-NYC"
-    }
-
-    num_vars = len(labels)
-    angles = np.linspace(0, 2*np.pi, num_vars, endpoint=False).tolist()
+    # [FIX] Calculate angles HERE (Before the plotting loop)
+    angles = [n / float(N) * 2 * pi for n in range(N)]
     angles += angles[:1]
 
-    plt.figure(figsize=(9, 9))
-    ax = plt.subplot(111, polar=True)
+    # Define methods to plot
+    methods_to_plot = {
+        "original": {"label": "Original",   "color": "blue",   "style": "dotted"},
+        "hs":       {"label": "H&S",        "color": "orange", "style": "dashed"},
+        "ufd":      {"label": "UFD",        "color": "green",  "style": "solid"},
+        "ufd_nyc":  {"label": "UFD-NYC",    "color": "red",    "style": "solid"}
+    }
 
-    for m in methods:
-        vals = metrics_normalized(m)
-        vals = [0 if v is None else v for v in vals]
-        vals += vals[:1]
+    # Helper to handle "hs" vs "HandS" mismatch
+    def get_text_metric(method_key, metric):
+        if method_key in text_data:
+            return text_data[method_key].get(metric, 0)
+        if method_key == "hs" and "HandS" in text_data:
+            return text_data["HandS"].get(metric, 0)
+        return 0
 
-        ax.plot(angles, vals, label=method_names[m], linewidth=2)
-        ax.fill(angles, vals, alpha=0.12)
+    # Prepare data
+    plot_data = {}
 
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(labels, fontsize=12)
-    ax.set_yticklabels([])
+    for m in methods_to_plot.keys():
+        # 1. Get Search Score
+        ndcg_val = ndcg_data.get(m, {}).get("bm25@10", 0)
+        if ndcg_val == 0:
+             ndcg_val = ndcg_data.get(m, {}).get("bm25@20", 0)
 
-    # annotation
-    plt.text(0.5, -0.15, "Scores normalized to [0, 1]", transform=ax.transAxes,
-             ha="center", fontsize=12)
+        # 2. Get Text Scores
+        readability  = get_text_metric(m, "readability") / 5.0
+        faithfulness = get_text_metric(m, "faithfulness") / 5.0
+        completeness = get_text_metric(m, "completeness") / 5.0
+        conciseness  = get_text_metric(m, "conciseness") / 5.0
 
-    plt.legend(loc="upper right", bbox_to_anchor=(1.25, 1.1))
-    plt.savefig(out_path, dpi=300, bbox_inches="tight")
-    print(f"[SAVED] Radar plot → {out_path}")
+        if ndcg_val == 0 and readability == 0:
+            # Skip if absolutely no data found
+            continue
+
+        values = [ndcg_val, readability, faithfulness, completeness, conciseness]
+        values += values[:1] # Close the loop
+        
+        plot_data[m] = values
+
+    # Draw Plot
+    fig, ax = plt.subplots(figsize=(9, 9), subplot_kw=dict(polar=True))
+
+    for m, values in plot_data.items():
+        config = methods_to_plot.get(m, {})
+        
+        # Highlight UFD-NYC
+        lw = 3 if m == "ufd_nyc" else 2
+        alpha = 0.15 if m == "ufd_nyc" else 0.05
+        
+        ax.plot(angles, values, linewidth=lw, linestyle=config["style"], 
+                label=config["label"], color=config["color"])
+        ax.fill(angles, values, config["color"], alpha=alpha)
+
+    # Setup Axes
+    plt.xticks(angles[:-1], labels, size=11)
+    ax.set_rlabel_position(0)
+    plt.yticks([0.2, 0.4, 0.6, 0.8, 1.0], ["0.2", "0.4", "0.6", "0.8", "1.0"], color="grey", size=8)
+    plt.ylim(0, 1)
+
+    plt.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1))
+    plt.title('Method Comparison: AutoDDG-NYC vs Baselines', size=15, y=1.1)
+
+    # Save
+    OUTPUT_PLOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(OUTPUT_PLOT_PATH, dpi=150, bbox_inches="tight")
+    print(f" [SAVED] Radar plot -> {OUTPUT_PLOT_PATH}")
+
+    # Save Summary Table
+    with open(OUTPUT_TABLE_PATH, "w", encoding="utf-8") as f:
+        json.dump(plot_data, f, indent=2)
 
 
-# -----------------------------
-#   Save metrics table (normalized)
-# -----------------------------
-def save_metrics_table(text_summary, ndcg_summary, out_path="../../outputs/eval_results.json"):
-    out = {}
-    methods = ["original", "hs", "ufd", "ufd_nyc", "sfd", "sfd_nyc"]
+def main():
+    if not NDCG_PATH.exists() or not TEXT_EVAL_PATH.exists():
+        print("[ERROR] Input files missing in 'outputs' folder.")
+        return
 
-    for m in methods:
-        out[m] = {
-            "lexical_matching_bm25": round(ndcg_summary[m]["bm25@20"], 4),
-            "completeness": round(text_summary[m]["completeness"] / 10.0, 4),
-            "conciseness": round(text_summary[m]["conciseness"] / 10.0, 4),
-            "readability": round(text_summary[m]["readability"] / 10.0, 4),
-            "faithfulness": round(text_summary[m]["faithfulness"] / 10.0, 4),
-        }
+    ndcg_data = load_json(NDCG_PATH)
+    text_data = load_json(TEXT_EVAL_PATH)
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2)
+    make_radar_chart(ndcg_data, text_data)
+    print("-" * 60)
+    print(" Done!")
+    print("-" * 60)
 
-    print(f"[SAVED] Metrics table → {out_path}")
-
-
-# -----------------------------
-#   Main
-# -----------------------------
 if __name__ == "__main__":
-
-    ndcg = load_ndcg("ndcg_eval_results.json")
-    text_records = load_text_eval("text_eval_results.jsonl")
-
-    text_summary = aggregate_text_eval(text_records)
-
-    make_radar_plot(text_summary, ndcg)
-
-    save_metrics_table(text_summary, ndcg)
+    main()

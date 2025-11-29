@@ -12,6 +12,8 @@ import random
 import os
 import csv
 import json
+import time
+from pathlib import Path
 from dotenv import load_dotenv
 import google.generativeai as genai
 
@@ -32,7 +34,18 @@ MODEL_NAME = "gemini-2.5-flash"
 #            STEP 1 — LOAD METADATA & PICK DATASETS
 # ============================================================
 
-def load_metadata(path="../../outputs/metadata_registry.json"):
+def load_metadata(path=None):
+  
+    if path is None:
+
+        # .parent = src/evaluation
+        # .parent.parent = src
+        # .parent.parent.parent =  autoddg-nyc
+        base_dir = Path(__file__).resolve().parent.parent.parent
+        path = base_dir / "outputs" / "metadata_registry.json"
+
+    print(f"[DEBUG] Loading metadata from: {path}")  
+
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -57,8 +70,16 @@ def choose_datasets(metadata, target_count=50, seed=42):
 def generate_queries(metadata=None, num_queries=20):
 
     queries = []
-    with open("queries.txt", "r", encoding="utf-8") as f:
-        queries = [line.strip() for line in f]
+    
+
+    base_dir = Path(__file__).resolve().parent
+
+    queries_path = base_dir / "queries.txt"
+
+    print(f"[DEBUG] Loading queries from: {queries_path}") 
+
+    with open(queries_path, "r", encoding="utf-8") as f:
+        queries = [line.strip() for line in f if line.strip()]
 
     return queries[:num_queries]
 

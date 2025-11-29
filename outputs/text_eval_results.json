@@ -1,0 +1,26 @@
+{
+  "original": {
+    "readability": 4.4,
+    "faithfulness": 4.7,
+    "completeness": 2.95,
+    "conciseness": 4.45
+  },
+  "HandS": {
+    "readability": 3.85,
+    "faithfulness": 4.4,
+    "completeness": 2.65,
+    "conciseness": 4.65
+  },
+  "ufd": {
+    "readability": 4.7,
+    "faithfulness": 4.15,
+    "completeness": 2.85,
+    "conciseness": 4.4
+  },
+  "ufd_nyc": {
+    "readability": 4.8,
+    "faithfulness": 4.6,
+    "completeness": 2.95,
+    "conciseness": 4
+  }
+}

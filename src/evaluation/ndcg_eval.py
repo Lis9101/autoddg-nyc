@@ -1,5 +1,8 @@
 """
-Standalone NDCG evaluator for AutoDDG (BM25 only).
+File: src/evaluation/ndcg_eval.py
+Description:
+    Standalone NDCG evaluator for AutoDDG (BM25 only).
+    Fixed with absolute paths to prevent FileNotFoundError.
 
 Reads:
     - baseline JSONL (descriptions)
@@ -11,14 +14,36 @@ Computes BM25 NDCG@10 and @20 for:
     hs, ufd, sfd, ufd_nyc, sfd_nyc, original
 
 Outputs:
-    ndcg_results.json
+    outputs/ndcg_eval_results.json
 """
 
 import json
 import math
+import argparse
 from typing import Dict, List
 import pandas as pd
 from collections import Counter
+from pathlib import Path
+
+# ================================================================
+# Path Configuration (Fixed Absolute Paths)
+# ================================================================
+
+# Define project root
+# Current file: src/evaluation/ndcg_eval.py 
+# .parent = src/evaluation 
+# .parent.parent = src 
+# .parent.parent.parent = autoddg-nyc (Root)
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+
+# Input paths
+METADATA_PATH = BASE_DIR / "outputs" / "metadata_registry.json"
+BASELINE_PATH = BASE_DIR / "outputs" / "baseline_autoddg_descriptions.jsonl"
+QUERIES_PATH = BASE_DIR / "src" / "evaluation" / "queries.txt"
+RELEVANCE_MATRIX_PATH = BASE_DIR / "relevance_matrix.csv"
+
+# Output path
+OUTPUT_JSON_PATH = BASE_DIR / "outputs" / "ndcg_eval_results.json"
 
 
 # ======================================
@@ -109,15 +134,23 @@ def compute_ndcg_for_method(
 # ======================================
 
 def run_ndcg_evaluation(
-    baseline_jsonl: str,
-    metadata_json: str,      # ← NEW
-    queries_txt: str,
-    relevance_csv: str,
-    output_json: str,
+    baseline_jsonl: Path,
+    metadata_json: Path,      
+    queries_txt: Path,
+    relevance_csv: Path,
+    output_json: Path,
 ):
+    print("-" * 60)
+    print(" Running NDCG Evaluation (BM25)")
+    print("-" * 60)
+    
     # ----------------------------------------------------
     # Load metadata JSON (original descriptions)
     # ----------------------------------------------------
+    if not metadata_json.exists():
+        print(f"[ERROR] Metadata file not found at: {metadata_json}")
+        return
+
     with open(metadata_json, "r", encoding="utf-8") as f:
         metadata = json.load(f)
 
@@ -126,7 +159,12 @@ def run_ndcg_evaluation(
     # ----------------------------------------------------
     # Load baseline JSONL
     # ----------------------------------------------------
+    if not baseline_jsonl.exists():
+        print(f"[ERROR] Baseline descriptions not found at: {baseline_jsonl}")
+        return
+
     dataset_records = {}
+    print(f"[INFO] Loading descriptions from {baseline_jsonl}...")
 
     with open(baseline_jsonl, "r", encoding="utf-8") as f:
         for line in f:
@@ -141,7 +179,7 @@ def run_ndcg_evaluation(
                 "sfd": rec.get("sfd", ""),
                 "ufd_nyc": rec.get("ufd_nyc", ""),
                 "sfd_nyc": rec.get("sfd_nyc", ""),
-                "original": original_map.get(ds, "")  # ← correct source
+                "original": original_map.get(ds, "")  # correct source
             }
 
     baseline_ids = set(dataset_records.keys())
@@ -149,20 +187,30 @@ def run_ndcg_evaluation(
     # ----------------------------------------------------
     # Load queries
     # ----------------------------------------------------
+    if not queries_txt.exists():
+        print(f"[ERROR] Queries file not found at: {queries_txt}")
+        return
+
     with open(queries_txt, "r", encoding="utf-8") as f:
         queries = [q.strip() for q in f if q.strip()]
 
     # ----------------------------------------------------
     # Load relevance
     # ----------------------------------------------------
+    if not relevance_csv.exists():
+        print(f"[ERROR] Relevance matrix not found at: {relevance_csv}")
+        return
+
+    print(f"[INFO] Loading relevance matrix from {relevance_csv}...")
     rel_df = pd.read_csv(relevance_csv)
     rel_ids = set(rel_df["dataset_id"].astype(str))
 
+    # Check for missing IDs
     if not rel_ids.issubset(baseline_ids):
         missing = rel_ids - baseline_ids
         print("[WARNING] baseline JSONL does NOT contain all dataset_ids from relevance CSV.")
-        print(f"Missing count: {len(missing)}")
-        print(f"Example missing: {list(missing)[:10]}\n")
+        # print(f"Missing count: {len(missing)}")
+        # print(f"Example missing: {list(missing)[:10]}\n")
 
     relevance = {}
     for col in rel_df.columns:
@@ -179,8 +227,9 @@ def run_ndcg_evaluation(
     methods = ["hs", "ufd", "sfd", "ufd_nyc", "sfd_nyc", "original"]
     results = {}
 
+    print("[INFO] Computing BM25 Scores...")
     for m in methods:
-        print(f"Computing {m} ...")
+        # print(f"   Computing {m} ...")
         ndcg10 = compute_ndcg_for_method(queries, dataset_records, relevance, m, 10)
         ndcg20 = compute_ndcg_for_method(queries, dataset_records, relevance, m, 20)
 
@@ -188,14 +237,19 @@ def run_ndcg_evaluation(
             "bm25@10": ndcg10,
             "bm25@20": ndcg20,
         }
+        print(f"   {m:10s} -> NDCG@10: {ndcg10:.4f}")
 
     # ----------------------------------------------------
     # Save final output
     # ----------------------------------------------------
+    output_json.parent.mkdir(parents=True, exist_ok=True)
+    
     with open(output_json, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
 
-    print("\nSaved NDCG results →", output_json)
+    print("-" * 60)
+    print(f" Saved NDCG results -> {output_json}")
+    print("-" * 60)
 
 
 # ======================================
@@ -204,9 +258,9 @@ def run_ndcg_evaluation(
 
 if __name__ == "__main__":
     run_ndcg_evaluation(
-        baseline_jsonl="../../outputs/baseline_autoddg_descriptions.jsonl",
-        metadata_json="../../outputs/metadata_registry.json",
-        queries_txt="queries.txt",
-        relevance_csv="relevance_matrix.csv",
-        output_json="ndcg_eval_results.json"
+        baseline_jsonl=BASELINE_PATH,
+        metadata_json=METADATA_PATH,
+        queries_txt=QUERIES_PATH,
+        relevance_csv=RELEVANCE_MATRIX_PATH,
+        output_json=OUTPUT_JSON_PATH
     )

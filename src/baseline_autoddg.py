@@ -7,37 +7,53 @@ Description:
       - Build semantic profiles using Gemini (column-limited)
       - Generate H+S (Header + Sample) description via LLM
       - Generate UFD and SFD descriptions via LLM
-      - Append results to data/baseline_autoddg_descriptions.jsonl
+      - [NEW] Generate AutoDDG-NYC descriptions (Domain Customization)
+      - Append results to outputs/baseline_autoddg_descriptions.jsonl
 
     Features:
       - Skips datasets already processed (resume support)
       - Optional --max_datasets batching
       - Stops immediately on Gemini quota errors
+      - Automatic absolute path resolution
 
     Usage:
         python src/baseline_autoddg.py
-        python src/baseline_autoddg.py --max_datasets 50
 """
 
 import argparse
 import json
 import time
+import pandas as pd
 from pathlib import Path
 
-from baseline.descriptions_autoddg import sample_rows
+# Import baseline functions
+from baseline.descriptions_autoddg import sample_rows, generate_ufd, generate_sfd
 from baseline.profiling_autoddg import profile_dataset
 from baseline.semantic_autoddg import build_semantic_profile
-from baseline.descriptions_autoddg import generate_ufd, generate_sfd
 from baseline.llm_client import call_llm
 
+# [Week 3] Import NYC customization functions
+from baseline.descriptions_nyc import generate_ufd_nyc, generate_sfd_nyc
+
 
 # ================================================================
-# File paths
+# File paths (Fixed with Absolute Paths)
 # ================================================================
 
-OUTPUT_PATH = Path("../outputs/baseline_autoddg_descriptions.jsonl")
-REGISTRY_PATH = Path("../outputs/metadata_registry.json")
-RUNTIME_LOG_PATH = Path("../outputs/baseline_autoddg_runtime.jsonl")
+# Determine the project root directory regardless of where the script is run
+# Current file is in src/baseline_autoddg.py -> parent=src -> parent.parent=root
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Define absolute paths for outputs
+OUTPUT_PATH = BASE_DIR / "outputs" / "baseline_autoddg_descriptions.jsonl"
+REGISTRY_PATH = BASE_DIR / "outputs" / "metadata_registry.json"
+RUNTIME_LOG_PATH = BASE_DIR / "outputs" / "baseline_autoddg_runtime.jsonl"
+
+# The relevance matrix is in the project root directory
+RELEVANCE_MATRIX_PATH = BASE_DIR / "relevance_matrix.csv"
+
+# Define the base data directory
+DATA_DIR_ROOT = BASE_DIR / "data"
 
 
 # ================================================================
@@ -84,7 +100,7 @@ def log_runtime(dataset_id: str, duration: float):
 
 
 # ================================================================
-# NEW: H+S (Header + Sample) LLM generation
+# H+S (Header + Sample) LLM generation
 # ================================================================
 
 def generate_hs_via_llm(headers, sample):
@@ -114,7 +130,7 @@ Return plain text. Do NOT use JSON.
 def run_baseline_autoddg(max_datasets: int | None = None, test_mode: bool = False):
     # Load registry
     if not REGISTRY_PATH.exists():
-        print(f"ERROR: Registry file missing at {REGISTRY_PATH}")
+        print(f"[ERROR] Registry file missing at {REGISTRY_PATH}")
         return
 
     registry = json.load(REGISTRY_PATH.open("r", encoding="utf-8"))
@@ -123,24 +139,26 @@ def run_baseline_autoddg(max_datasets: int | None = None, test_mode: bool = Fals
     # TEST MODE: filter registry
     # ----------------------------
     if test_mode:
-        import pandas as pd
+        print(f"[DEBUG] Reading relevance matrix from: {RELEVANCE_MATRIX_PATH}")
+        
+        if not RELEVANCE_MATRIX_PATH.exists():
+            print("[ERROR] Relevance matrix file not found!")
+            print("Please run 'python src/evaluation/get_ndcg_ground_truth.py' first.")
+            return
 
-        # === Read relevance CSV ===
-        rel_df = pd.read_csv("evaluation/relevance_matrix.csv")
+        rel_df = pd.read_csv(RELEVANCE_MATRIX_PATH)
 
         relevance_ids = set(rel_df["dataset_id"].astype(str))
 
         print("[DEBUG] relevance dataset count =", len(relevance_ids))
-        print("[DEBUG] sample relevance ids:", list(relevance_ids)[:10])
-
+        
         # === Mask registry: only keep datasets appearing in relevance ===
         original_registry_size = len(registry)
         registry = [item for item in registry if str(item.get("id")) in relevance_ids]
 
-        print(f"[DEBUG] registry filtered: {original_registry_size} → {len(registry)}")
-        print("[DEBUG] sample registry ids:", [item["id"] for item in registry[:10]])
+        print(f"[DEBUG] registry filtered: {original_registry_size} -> {len(registry)}")
 
-
+    # Ensure output directory exists
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     processed = load_processed_ids(OUTPUT_PATH)
@@ -164,9 +182,20 @@ def run_baseline_autoddg(max_datasets: int | None = None, test_mode: bool = Fals
         if max_datasets is not None and done_this_run >= max_datasets:
             break
 
-        csv_path = Path(f"../data/csv_files/{ds_id}.csv")
+        # [FIX] Try to find the CSV file in multiple possible locations
+        # Strategy 1: data/csv_files/ID.csv
+        csv_path = DATA_DIR_ROOT / "csv_files" / f"{ds_id}.csv"
+        
+        # Strategy 2: data/ID.csv (based on your screenshot)
         if not csv_path.exists():
-            print(f"[WARN] Missing CSV for {ds_id}")
+             csv_path = DATA_DIR_ROOT / f"{ds_id}.csv"
+        
+        # Strategy 3: outputs/ID.csv (fallback)
+        if not csv_path.exists():
+            csv_path = BASE_DIR / "outputs" / f"{ds_id}.csv"
+        
+        if not csv_path.exists():
+            print(f"[WARN] Missing CSV for {ds_id} (Checked data/ and data/csv_files/)")
             failed += 1
             continue
 
@@ -212,7 +241,7 @@ def run_baseline_autoddg(max_datasets: int | None = None, test_mode: bool = Fals
             time.sleep(1)
 
             # ---------------------------------------------------------
-            # 5) UFD / SFD (LLM)
+            # 5) UFD / SFD (LLM - Baseline)
             # ---------------------------------------------------------
             ufd = generate_ufd(
                 csv_path=csv_path,
@@ -228,7 +257,23 @@ def run_baseline_autoddg(max_datasets: int | None = None, test_mode: bool = Fals
             time.sleep(1)
 
             # ---------------------------------------------------------
-            # 6) Save Record (HandS placed BEFORE ufd)
+            # 6) AutoDDG-NYC (Week 3: Domain Customization)
+            # ---------------------------------------------------------
+            # Use the specialized functions to generate NYC-tailored descriptions.
+            ufd_nyc = generate_ufd_nyc(
+                csv_path=csv_path,
+                content_profile=content_profile,
+                semantic_profile=semantic_profile,
+                topic=topic,
+                metadata=item
+            )
+
+            time.sleep(1)
+
+            sfd_nyc = generate_sfd_nyc(ufd_nyc=ufd_nyc, metadata=item)
+
+            # ---------------------------------------------------------
+            # 7) Save Record
             # ---------------------------------------------------------
             record = {
                 "dataset_id": ds_id,
@@ -239,15 +284,15 @@ def run_baseline_autoddg(max_datasets: int | None = None, test_mode: bool = Fals
                 "content_profile": content_profile,
                 "semantic_profile": semantic_profile,
 
-                # NEW: HandS before UFD
+                # HandS before UFD
                 "HandS": hs_desc,
 
                 "ufd": ufd,
                 "sfd": sfd,
 
-                # dummy NYC versions (Domain customization)
-                "ufd_nyc": ufd,
-                "sfd_nyc": sfd
+                # Real NYC versions
+                "ufd_nyc": ufd_nyc,
+                "sfd_nyc": sfd_nyc
             }
 
             with OUTPUT_PATH.open("a", encoding="utf-8") as out:
