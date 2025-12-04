@@ -17,4 +17,6 @@ env/
 *.csv
 data/*
 !data/metadata_registry.json
+!data/0_baseline_autoddg_descriptions.jsonl
+!data/0_baseline_autoddg_runtime.jsonl
 results/
