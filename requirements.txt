@@ -9,3 +9,5 @@ nltk
 bert-score
 rouge-score
 matplotlib>=3.8
+
+pyspark
