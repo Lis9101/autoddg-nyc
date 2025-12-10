@@ -40,7 +40,7 @@ You can mix and match these samplers or add your own by inheriting from
 
 ---
 
-## Installation / Imports
+## Installation
 
 The samplers only depend on packages that are already in the root
 `requirements.txt`:
