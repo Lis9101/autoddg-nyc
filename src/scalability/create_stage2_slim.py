@@ -9,8 +9,8 @@ ROOT_DIR = THIS_FILE.parents[2]       # .../autoddg-nyc
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-OUTPUT_PATH = ROOT_DIR / "outputs" / "stage2_slim.jsonl"
-INPUT_PATH = ROOT_DIR / "outputs" / "stage2_async_nyc_descriptions.jsonl"
+OUTPUT_PATH = ROOT_DIR / "outputs" / "stage2_async_nyc_descriptions.jsonl"
+INPUT_PATH = ROOT_DIR / "outputs" / "stage2_raw.jsonl"
 
 INPUT = Path(INPUT_PATH)
 OUTPUT = Path(OUTPUT_PATH)

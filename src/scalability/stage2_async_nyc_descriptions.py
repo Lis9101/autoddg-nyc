@@ -1,38 +1,11 @@
 """
 Stage 2: Asynchronous NYC Descriptions (AutoDDG-NYC, scalable version)
 
-Design:
-  - Input: Spark-based Stage 1 profiles from:
-        outputs/stage1_spark_profiles.jsonl
-
-        Each record (simplified) looks like:
-        {
-          "dataset_id": "8wbx-tsch",
-          "status": "ok",
-          "row_count": 12345,
-          "column_count": 12,
-          "columns": ["col1", "col2", ...]
-        }
-
-  - This stage:
-      * Filters to status=="ok" datasets.
-      * For each dataset (concurrently, with bounded concurrency):
-          - Finds the CSV file (same logic as baseline_autoddg).
-          - Recomputes the full Pandas-based content_profile using
-                baseline.profiling_autoddg.profile_dataset
-            so the pipeline matches the original baseline.
-          - Builds a semantic profile with
-                baseline.semantic_autoddg.build_semantic_profile
-          - Generates NYC-specific UFD/SFD via
-                baseline.descriptions_nyc.generate_ufd_nyc / generate_sfd_nyc
-      * Appends results to:
-            outputs/stage2_async_nyc_descriptions.jsonl
-
-  - Features:
-      * Bounded concurrency via asyncio (default concurrency=5).
-      * Resume support: skips datasets already processed with status=="ok"
-        in the Stage 2 output file.
-      * Logs runtime and throughput (#ok datasets per hour).
+Description: 
+    Generates UFD_NYC and SFD_NYC for datasets using LLMs, in an 
+    asynchronous manner with bounded concurrency. 
+    Supports resume and logs runtime/throughput to produce 
+    stage2_raw.jsonl.
 
 Usage:
     python src/scalability/stage2_async_nyc_descriptions.py \
@@ -64,7 +37,7 @@ from baseline.descriptions_nyc import generate_ufd_nyc, generate_sfd_nyc
 # ----- Project paths -----
 STAGE1_PROFILES_PATH = ROOT_DIR / "outputs" / "stage1_spark_profiles.jsonl"
 REGISTRY_PATH = ROOT_DIR / "outputs" / "metadata_registry.json"
-OUTPUT_PATH = ROOT_DIR / "outputs" / "stage2_async_nyc_descriptions.jsonl"
+OUTPUT_PATH = ROOT_DIR / "outputs" / "stage2_raw.jsonl"
 DATA_DIR_ROOT = ROOT_DIR / "data"
 
 

@@ -20,3 +20,4 @@ data/*
 !data/0_baseline_autoddg_descriptions.jsonl
 !data/0_baseline_autoddg_runtime.jsonl
 results/
+outputs/stage2_raw.jsonl

@@ -1,15 +1,11 @@
 """
 Stage 1: Spark-based Profiling for AutoDDG / AutoDDG-NYC.
 
-Goal:
-  - Use PySpark DataFrame API to profile each dataset:
-      * row_count
-      * column_count
-      * column names
-  - Write one JSON record per dataset to outputs/stage1_spark_profiles.jsonl
+Description:
+  - Uses PySpark to compute minimal dataset profiles (row_count, column_count, column names).
+  - Writes one JSON record per dataset to outputs/stage1_spark_profiles.jsonl.
+  - Kept intentionally minimal to avoid Windows stability issues with Spark integration.
 
-We intentionally keep this minimal (no df.describe()) to avoid stability issues
-on Windows while still demonstrating Spark usage in the project.
 """
 
 import argparse

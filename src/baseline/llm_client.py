@@ -12,11 +12,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY missing in .env")
 
-<<<<<<< HEAD
-GEMINI_MODEL_NAME = "gemini-2.0-flash"
-=======
 GEMINI_MODEL_NAME = "gemini-2.5-flash"
->>>>>>> scalability
 
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel(GEMINI_MODEL_NAME)
