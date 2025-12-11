@@ -1,30 +1,23 @@
 # Contents
 
-## Week 1
+The `/baseline` folder contains the code for building the baseline AutoDDG. `descriptions_nyc.py` in this folder contains the the new nyc-specific prompts for the llm.
+The `/evaluation` folder contains the code for evaluation.
+The `/scalability` folder contains the code for building the scalability pipeline.
 
-- `data_collector.py` - Bulk downloader. Collects NYC Open Data datasets (tabular only), saves
-  CSV samples, and builds the metadata registry.
-- `download_from_registry.py` - Team sync tool. Restores missing CSV files using the shared
-  `metadata_registry.json`.
-- `pipeline_test.py`- End-to-end test to verify Socrata + Gemini APIs.
-- `check_models.py`- Lists Gemini models available to your API key.
-- `metadata_registry.json`: Shared dataset registry created in Week 1.
+All generated results are saved to outputs folder. Here're the important files
 
-## Week 2
+- `metadata_registry` - contains metadata for all 2000 datasets, including original description
+- `0_baseline_autoddg_descrioptions.jsonl` - contains generated dataset description using the baseline AutoDDG (ufd and sfd)
+- `stage_2_async_nyc_descriptions.jsonl` - contains generated dataset description using the AutoDDG with nyc-specific prompts (ufd_nyc and sfd_nyc)
+- `eval_radar.png` - contains the radar graph for final evaluation results.
 
-Baseline AutoDDG implementation.
+### AutoDDG fast
 
-- `baseline/profiling_autoddg.py` - Generates Content Summaries (non-LLM): column types, null ratios, unique counts, stats, sample values.
-- `baseline/semantic_autoddg.py` - Generates Semantic Summaries (LLM): temporal/spatial detection, entity types, usage roles. Includes column filtering to reduce Gemini quota usage.
-- `baseline/descriptions_autoddg.py` - Produces UFD (User-Focused Description) and SFD (Search-Focused Description).
-- `baseline/llm_client.py` - Central Gemini client with the gemini-2.0-flash model.
-- `baseline_autoddg.py` - Main Baseline AutoDDG runner. Loads each dataset, builds summaries, generates UFD+SFD, and writes results to:
-  - `data/0_baseline_autoddg_descriptions.jsonl`
-  - `data/0_baseline_autoddg_runtime.jsonl`
+```
+python src/run_scalable_pipeline.py
+```
 
-Supports resume (skips completed datasets) and stops on quota errors.
-
-### Run baseline AutoDDG
+### Run AutoDDG (takes a long time)
 
 ```
 python src/baseline_autoddg.py
