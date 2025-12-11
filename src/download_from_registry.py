@@ -19,7 +19,7 @@ from sodapy import Socrata
 from dotenv import load_dotenv
 
 # --- Configuration ---
-DATA_DIR = "data"
+DATA_DIR = "../outputs"
 METADATA_FILE = os.path.join(DATA_DIR, "metadata_registry.json")
 DOWNLOAD_ROWS_LIMIT = 100 
 

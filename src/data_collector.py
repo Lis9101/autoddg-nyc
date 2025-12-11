@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 # --- Configuration ---
 TARGET_DATASET_COUNT = 2000   # Test with 20, then change to 2000
 DOWNLOAD_ROWS_LIMIT = 100   
-DATA_DIR = "data"
+DATA_DIR = "../data/csv_files"
 METADATA_FILE = os.path.join(DATA_DIR, "metadata_registry.json")
 
 # 1. Load environment variables

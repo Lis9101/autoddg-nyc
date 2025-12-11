@@ -1,0 +1,32 @@
+{
+  "original": {
+    "readability": 4.45,
+    "faithfulness": 4.85,
+    "completeness": 2.75,
+    "conciseness": 4.2
+  },
+  "ufd": {
+    "readability": 4.65,
+    "faithfulness": 4.8,
+    "completeness": 2.95,
+    "conciseness": 4.45
+  },
+  "sfd": {
+    "readability": 5,
+    "faithfulness": 4.8,
+    "completeness": 2.95,
+    "conciseness": 4.95
+  },
+  "ufd_nyc": {
+    "readability": 5,
+    "faithfulness": 4.75,
+    "completeness": 2.95,
+    "conciseness": 4.05
+  },
+  "sfd_nyc": {
+    "readability": 4.8,
+    "faithfulness": 4.8,
+    "completeness": 3.05,
+    "conciseness": 4.5
+  }
+}

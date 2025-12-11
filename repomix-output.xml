@@ -1,0 +1,2248 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+baseline_autoddg.py
+baseline/descriptions_autoddg.py
+baseline/llm_client.py
+baseline/profiling_autoddg.py
+baseline/semantic_autoddg.py
+check_models.py
+data_collector.py
+download_from_registry.py
+evaluation/evaluator.py
+evaluation/get_ndcg_ground_truth.py
+evaluation/ndcg_eval_results.json
+evaluation/ndcg_eval.py
+evaluation/queries.txt
+evaluation/readme.txt
+evaluation/text_eval_results.jsonl
+evaluation/text_eval.py
+pipeline_test.py
+README.md
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="baseline_autoddg.py">
+"""
+File: baseline_autoddg.py
+Description:
+    Main runner for the Baseline AutoDDG pipeline.
+      - Load datasets listed in metadata_registry.json
+      - Build data-driven content profiles (no LLM)
+      - Build semantic profiles using Gemini (column-limited)
+      - Generate H+S (Header + Sample) description via LLM
+      - Generate UFD and SFD descriptions via LLM
+      - Append results to data/baseline_autoddg_descriptions.jsonl
+
+    Features:
+      - Skips datasets already processed (resume support)
+      - Optional --max_datasets batching
+      - Stops immediately on Gemini quota errors
+
+    Usage:
+        python src/baseline_autoddg.py
+        python src/baseline_autoddg.py --max_datasets 50
+"""
+
+import argparse
+import json
+import time
+from pathlib import Path
+
+from baseline.descriptions_autoddg import sample_rows
+from baseline.profiling_autoddg import profile_dataset
+from baseline.semantic_autoddg import build_semantic_profile
+from baseline.descriptions_autoddg import generate_ufd, generate_sfd
+from baseline.llm_client import call_llm
+
+
+# ================================================================
+# File paths
+# ================================================================
+
+OUTPUT_PATH = Path("../outputs/baseline_autoddg_descriptions.jsonl")
+REGISTRY_PATH = Path("../outputs/metadata_registry.json")
+RUNTIME_LOG_PATH = Path("../outputs/baseline_autoddg_runtime.jsonl")
+
+
+# ================================================================
+# Helpers
+# ================================================================
+
+def load_processed_ids(path: Path) -> set:
+    """Return dataset_ids already processed (resume support)."""
+    if not path.exists():
+        return set()
+    ids = set()
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+                if rec.get("dataset_id"):
+                    ids.add(rec["dataset_id"])
+            except:
+                pass
+    return ids
+
+
+def derive_topic_from_metadata(item: dict) -> str:
+    """Prefer category, fallback to first 2–3 words of name."""
+    if item.get("category"):
+        return item["category"]
+    name = item.get("name", "")
+    parts = name.split()
+    return " ".join(parts[:3]) if parts else "Unknown dataset"
+
+
+def is_quota_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return ("quota" in msg) or ("429" in msg) or ("exceeded" in msg)
+
+
+def log_runtime(dataset_id: str, duration: float):
+    RUNTIME_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with RUNTIME_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "dataset_id": dataset_id,
+            "runtime_sec": round(duration, 3)
+        }) + "\n")
+
+
+# ================================================================
+# NEW: H+S (Header + Sample) LLM generation
+# ================================================================
+
+def generate_hs_via_llm(headers, sample):
+    """
+    LLM-based Header + Sample baseline.
+    Uses same logic as evaluator version.
+    """
+    header_list = ", ".join(headers)
+    prompt = f"""
+Generate a short dataset description using ONLY:
+
+Headers:
+{header_list}
+
+Sample:
+{sample}
+
+Return plain text. Do NOT use JSON.
+"""
+    return call_llm(prompt, temperature=0.0)
+
+
+# ================================================================
+# Main Runner
+# ================================================================
+
+def run_baseline_autoddg(max_datasets: int | None = None, test_mode: bool = False):
+    # Load registry
+    if not REGISTRY_PATH.exists():
+        print(f"ERROR: Registry file missing at {REGISTRY_PATH}")
+        return
+
+    registry = json.load(REGISTRY_PATH.open("r", encoding="utf-8"))
+
+    # ----------------------------
+    # TEST MODE: filter registry
+    # ----------------------------
+    if test_mode:
+        import pandas as pd
+
+        # === Read relevance CSV ===
+        rel_df = pd.read_csv("evaluation/relevance_matrix.csv")
+
+        relevance_ids = set(rel_df["dataset_id"].astype(str))
+
+        print("[DEBUG] relevance dataset count =", len(relevance_ids))
+        print("[DEBUG] sample relevance ids:", list(relevance_ids)[:10])
+
+        # === Mask registry: only keep datasets appearing in relevance ===
+        original_registry_size = len(registry)
+        registry = [item for item in registry if str(item.get("id")) in relevance_ids]
+
+        print(f"[DEBUG] registry filtered: {original_registry_size} → {len(registry)}")
+        print("[DEBUG] sample registry ids:", [item["id"] for item in registry[:10]])
+
+
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    processed = load_processed_ids(OUTPUT_PATH)
+    print(f"Found {len(processed)} datasets already processed.\n")
+
+    print("-" * 60)
+    print(" Running Baseline AutoDDG")
+    print("-" * 60)
+
+    done_this_run = 0
+    failed = 0
+
+    for item in registry:
+        ds_id = item["id"]
+        title = item.get("name", ds_id)
+        topic = derive_topic_from_metadata(item)
+
+        if ds_id in processed:
+            continue
+
+        if max_datasets is not None and done_this_run >= max_datasets:
+            break
+
+        csv_path = Path(f"../data/csv_files/{ds_id}.csv")
+        if not csv_path.exists():
+            print(f"[WARN] Missing CSV for {ds_id}")
+            failed += 1
+            continue
+
+        print(f"\nProcessing [{ds_id}] {title}")
+
+        try:
+            start = time.time()
+
+            # ---------------------------------------------------------
+            # 1) Content Profile (non-LLM)
+            # ---------------------------------------------------------
+            content_profile = profile_dataset(
+                csv_path=csv_path,
+                dataset_id=ds_id,
+                max_rows=item.get("sample_row_count")
+            )
+
+            # ---------------------------------------------------------
+            # 2) Sample rows
+            # ---------------------------------------------------------
+            sample_text = sample_rows(csv_path)
+
+            # ---------------------------------------------------------
+            # 3) Semantic Profile (LLM)
+            # ---------------------------------------------------------
+            semantic_profile = build_semantic_profile(
+                csv_path=csv_path,
+                content_profile=content_profile,
+                title=title,
+                description=item.get("description", ""),
+                topic=topic,
+                max_semantic_columns=12
+            )
+
+            time.sleep(1)
+
+            # ---------------------------------------------------------
+            # 4) H+S baseline (LLM)
+            # ---------------------------------------------------------
+            headers = [col["name"] for col in content_profile["columns"]]
+            hs_desc = generate_hs_via_llm(headers, sample_text)
+
+            time.sleep(1)
+
+            # ---------------------------------------------------------
+            # 5) UFD / SFD (LLM)
+            # ---------------------------------------------------------
+            ufd = generate_ufd(
+                csv_path=csv_path,
+                content_profile=content_profile,
+                semantic_profile=semantic_profile,
+                topic=topic,
+            )
+
+            time.sleep(1)
+
+            sfd = generate_sfd(topic=topic, ufd=ufd)
+
+            time.sleep(1)
+
+            # ---------------------------------------------------------
+            # 6) Save Record (HandS placed BEFORE ufd)
+            # ---------------------------------------------------------
+            record = {
+                "dataset_id": ds_id,
+                "title": title,
+                "topic": topic,
+
+                "sample": sample_text,
+                "content_profile": content_profile,
+                "semantic_profile": semantic_profile,
+
+                # NEW: HandS before UFD
+                "HandS": hs_desc,
+
+                "ufd": ufd,
+                "sfd": sfd,
+
+                # dummy NYC versions (Domain customization)
+                "ufd_nyc": ufd,
+                "sfd_nyc": sfd
+            }
+
+            with OUTPUT_PATH.open("a", encoding="utf-8") as out:
+                out.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+            duration = time.time() - start
+            log_runtime(ds_id, duration)
+
+            print(f"✓ Done [{ds_id}]")
+            done_this_run += 1
+
+        except Exception as e:
+            if is_quota_error(e):
+                print("=" * 60)
+                print("Gemini quota exhausted. Stopping.")
+                print("=" * 60)
+                raise e
+            failed += 1
+            print(f"[ERROR] Failed {ds_id}: {e}")
+
+    print("-" * 60)
+    print(" Baseline AutoDDG Completed")
+    print(f"   New processed: {done_this_run}")
+    print(f"   Failed       : {failed}")
+    print(f" Output saved to {OUTPUT_PATH}")
+    print("-" * 60)
+
+
+# ================================================================
+# CLI
+# ================================================================
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max_datasets", type=int, default=None)
+    args = parser.parse_args()
+
+    run_baseline_autoddg(max_datasets=args.max_datasets, test_mode=True)
+</file>
+
+<file path="baseline/descriptions_autoddg.py">
+"""
+File: descriptions_autoddg.py
+Description:
+    Generates UFD and SFD for Baseline AutoDDG using LLM.
+"""
+
+import json
+from pathlib import Path
+
+import pandas as pd
+
+from baseline.llm_client import call_llm
+
+
+# --- sampling settings ---
+
+MAX_SAMPLE_ROWS = 5          # how many rows to show
+MAX_SAMPLE_COLS = 10         # max number of columns to include in the sample
+MAX_COL_CELL_CHARS = 2000    # if a column has cells longer than this, we drop it from the sample
+MAX_UFD_PROMPT_CHARS = 60000  # well below llm_client's 120k
+
+def sample_rows(csv_path: Path, n: int = MAX_SAMPLE_ROWS) -> str:
+    """
+    Read a small sample of the CSV and only include columns whose
+    cell contents are not "too big" in the first n rows.
+
+    If all columns are too large, we return a small note instead of
+    a giant sample.
+    """
+    df = pd.read_csv(csv_path, nrows=n)
+
+    if df.empty:
+        return ""
+
+    # Work with strings to measure lengths
+    as_str = df.astype(str)
+
+    # For each column, look at the max cell length in the sample
+    col_max_len = as_str.apply(lambda col: col.str.len().max())
+
+    # Keep only "safe" columns whose max cell length is below the threshold
+    safe_cols = [col for col in df.columns if col_max_len[col] <= MAX_COL_CELL_CHARS]
+
+    if not safe_cols:
+        # All columns are huge; don't pass raw data into the prompt
+        return (
+            "# Sample omitted: all columns have very large cell values "
+            f"in the first {n} rows.\n"
+        )
+
+    # Optionally cap the number of columns we include
+    if len(safe_cols) > MAX_SAMPLE_COLS:
+        safe_cols = safe_cols[:MAX_SAMPLE_COLS]
+
+    df_safe = df[safe_cols]
+
+    return df_safe.to_csv(index=False)
+
+
+
+UFD_PROMPT = """You are generating a USER-FOCUSED description for a tabular dataset.
+
+Dataset topic: {topic}
+
+You are given:
+- A small CSV sample:
+{sample}
+
+- A data-driven content profile (JSON):
+{content_profile}
+
+- A semantic profile (JSON):
+{semantic_profile}
+
+Write 5–10 natural, readable sentences describing what the dataset is about,
+what key columns represent, and how someone might use it.
+"""
+
+
+SFD_PROMPT = """You are generating a SEARCH-FOCUSED description for a tabular dataset.
+
+Dataset topic: {topic}
+
+User-focused description:
+{ufd}
+
+Create the following sections in plain text:
+
+Dataset Overview:
+  2–4 sentences summarizing the dataset.
+
+Related Topics:
+  - bullet list of related domains and themes.
+
+Concepts and Synonyms:
+  - bullet list of important terms, phrases, and synonyms.
+
+Applications and Use Cases:
+  - bullet list of plausible ways to use this dataset.
+"""
+
+MAX_PROFILE_CHARS = 8000   # per JSON block
+
+def _safe_json_block(obj, max_chars=MAX_PROFILE_CHARS, label="profile") -> str:
+    s = json.dumps(obj, ensure_ascii=False)
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars] + f"\n...[{label} truncated at {max_chars} chars]..."
+
+def generate_ufd(csv_path: Path, content_profile: dict, semantic_profile: dict, topic: str) -> str:
+    sample = sample_rows(csv_path)
+    content_json = _safe_json_block(content_profile, label="content_profile")
+    semantic_json = _safe_json_block(semantic_profile, label="semantic_profile")
+
+    prompt = UFD_PROMPT.format(
+        topic=topic,
+        sample=sample,
+        content_profile=content_json,
+        semantic_profile=semantic_json,
+    )
+
+    # If still too large, first sacrifice the sample, then shrink profiles
+    if len(prompt) > MAX_UFD_PROMPT_CHARS:
+        # 1) Drop sample entirely
+        prompt_no_sample = UFD_PROMPT.format(
+            topic=topic,
+            sample="# Sample omitted due to size limits.\n",
+            content_profile=content_json,
+            semantic_profile=semantic_json,
+        )
+        prompt = prompt_no_sample
+
+    # If STILL huge, shrink JSON blocks further
+    if len(prompt) > MAX_UFD_PROMPT_CHARS:
+        content_json = _safe_json_block(content_profile, max_chars=4000, label="content_profile")
+        semantic_json = _safe_json_block(semantic_profile, max_chars=4000, label="semantic_profile")
+        prompt = UFD_PROMPT.format(
+            topic=topic,
+            sample="# Sample omitted due to size limits.\n",
+            content_profile=content_json,
+            semantic_profile=semantic_json,
+        )
+
+    return call_llm(prompt, temperature=0.3)
+
+def generate_sfd(topic: str, ufd: str) -> str:
+    prompt = SFD_PROMPT.format(topic=topic, ufd=ufd)
+    return call_llm(prompt, temperature=0.3)
+</file>
+
+<file path="baseline/llm_client.py">
+"""
+Gemini client for Baseline AutoDDG.
+"""
+
+import os
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY missing in .env")
+
+GEMINI_MODEL_NAME = "gemini-2.5-flash"
+
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+
+# ----------------------------------------------------------
+# GLOBAL SAFETY LIMIT: Prevent gigantic prompts causing 400
+# "input token count exceeds max (1048575)"
+# ----------------------------------------------------------
+
+# Gemini accepts up to around 1 million tokens,
+# but we stay WAY below that. ~120k chars ≈ 30–40k tokens.
+MAX_PROMPT_CHARS = 120000
+
+RAISE_ON_TRUNCATION = False  # flip to True while debugging
+
+def _truncate_prompt(prompt: str) -> str:
+    if len(prompt) <= MAX_PROMPT_CHARS:
+        return prompt
+
+    msg = (
+        f"[WARN] Truncating prompt from {len(prompt)} chars "
+        f"to {MAX_PROMPT_CHARS} chars to avoid token overflow."
+    )
+    print(msg)
+
+    if RAISE_ON_TRUNCATION:
+        raise RuntimeError(
+            f"Prompt too long ({len(prompt)} chars); caller should shrink inputs."
+        )
+
+    return (
+        prompt[:MAX_PROMPT_CHARS] +
+        f"\n\n...[prompt truncated from {len(prompt)} to {MAX_PROMPT_CHARS} chars]..."
+    )
+
+# Main LLM call
+def call_llm(prompt: str, temperature: float = 0.2) -> str:
+    # 🔥 Always truncate before sending to Gemini
+    prompt = _truncate_prompt(prompt)
+
+    response = model.generate_content(
+        prompt,
+        generation_config={"temperature": temperature},
+    )
+    if not response.candidates:
+        return ""
+
+    parts = response.candidates[0].content.parts
+    texts = [p.text for p in parts if hasattr(p, "text")]
+    return "\n".join(texts).strip()
+</file>
+
+<file path="baseline/profiling_autoddg.py">
+"""
+File: profiling_autoddg.py
+Description:
+    Data-driven (non-LLM) profiling used by Baseline AutoDDG.
+
+    Includes:
+        - infer_column_profile()
+        - profile_dataset()
+"""
+
+import pandas as pd
+from pathlib import Path
+from typing import Dict, Any
+
+def infer_column_profile(series: pd.Series, max_examples: int = 5) -> Dict[str, Any]:
+    col = series.dropna()
+
+    if pd.api.types.is_numeric_dtype(col):
+        coarse_type = "numeric"
+    elif pd.api.types.is_datetime64_any_dtype(col):
+        coarse_type = "datetime"
+    elif pd.api.types.is_bool_dtype(col):
+        coarse_type = "boolean"
+    else:
+        coarse_type = "text"
+
+    stats = {}
+    if coarse_type == "numeric":
+        try:
+            desc = col.describe(percentiles=[0.25, 0.5, 0.75])
+            stats = {
+                "min": float(desc.get("min", float("nan"))),
+                "max": float(desc.get("max", float("nan"))),
+                "mean": float(desc.get("mean", float("nan"))),
+                "std": float(desc.get("std", 0)),
+                "p25": float(desc.get("25%", float("nan"))),
+                "p50": float(desc.get("50%", float("nan"))),
+                "p75": float(desc.get("75%", float("nan"))),
+            }
+        except Exception:
+            stats = {
+                "min": None,
+                "max": None,
+                "mean": None,
+                "std": None,
+                "p25": None,
+                "p50": None,
+                "p75": None,
+            }
+
+    elif coarse_type == "datetime":
+        stats = {"min": str(col.min()), "max": str(col.max())}
+
+    else:
+        vc = col.value_counts().head(10)
+        stats = {"top_values": [{"value": str(v), "count": int(c)} for v, c in vc.items()]}
+
+    return {
+        "name": series.name,
+        "inferred_dtype": str(series.dtype),
+        "coarse_type": coarse_type,
+        "num_non_null": int(col.shape[0]),
+        "num_unique": int(col.nunique()),
+        "null_fraction": float(series.isna().mean()),
+        "stats": stats,
+        "example_values": [str(v) for v in col.head(max_examples)],
+    }
+
+def profile_dataset(csv_path: Path, dataset_id: str, max_rows=None) -> Dict[str, Any]:
+    df = pd.read_csv(csv_path, nrows=max_rows)
+    return {
+        "dataset_id": dataset_id,
+        "num_rows": int(df.shape[0]),
+        "num_columns": int(df.shape[1]),
+        "columns": [infer_column_profile(df[c]) for c in df.columns],
+    }
+</file>
+
+<file path="baseline/semantic_autoddg.py">
+"""
+File: semantic_autoddg.py  (UPDATED: merged LLM call version)
+Description:
+    Semantic profiling (LLM-based) for Baseline AutoDDG, modified to use **ONE**
+    LLM call per dataset instead of per-column.
+
+    Includes:
+        - sample_rows()
+        - build_semantic_profile()  (now uses merged prompt)
+        - _parse_multi_column_output()  (NEW)
+"""
+
+import json
+from pathlib import Path
+from typing import Dict, Any, List
+import pandas as pd
+import re
+
+from baseline.llm_client import call_llm
+
+
+# -------------------------------------------------------------------
+# New merged-column semantic prompt template
+# -------------------------------------------------------------------
+MERGED_SEMANTIC_PROMPT = """
+You are performing semantic profiling for MULTIPLE columns of a table.
+
+For EACH column, extract:
+
+- is_temporal (true/false)
+- temporal_resolution (e.g., second/minute/hour/day/month/year/unknown)
+- is_spatial (true/false)
+- spatial_resolution (e.g., point/region/address/unknown)
+- entity_type (e.g., person, location, event, measurement, id, etc.)
+- domain_specific_type (e.g., climate, transportation, finance, general, etc.)
+- function_or_usage (e.g., identifier, measurement, descriptor, category, etc.)
+
+Return STRICT JSON of the following structure:
+
+{{
+  "columns": [
+    {{
+      "name": "...",
+      "semantic": {{
+         "is_temporal": ...,
+         "temporal_resolution": "...",
+         "is_spatial": ...,
+         "spatial_resolution": "...",
+         "entity_type": "...",
+         "domain_specific_type": "...",
+         "function_or_usage": "..."
+      }}
+    }},
+    ...
+  ]
+}}
+
+Now analyze the following columns:
+
+{column_blocks}
+
+Output ONLY the JSON. No explanation.
+"""
+
+
+def sample_rows(csv_path: Path, n: int = 5) -> str:
+    df = pd.read_csv(csv_path, nrows=n)
+    return df.to_csv(index=False)
+
+
+# -------------------------------------------------------------------
+# Helper: parse multi-column JSON output from GPT
+# -------------------------------------------------------------------
+
+def _parse_multi_column_output(raw: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Robust JSON extractor:
+      - Removes surrounding text
+      - Extracts the first {...} block
+      - Returns {column_name: semantic_dict}
+    """
+    if not raw:
+        return {}
+
+    # ---- 1) Extract the JSON object between the FIRST '{' and LAST '}' ----
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return {}
+
+    json_str = raw[start:end+1].strip()
+
+    # ---- 2) Try to parse ----
+    try:
+        data = json.loads(json_str)
+    except Exception:
+        # If broken, try removing trailing commas, common GPT issue
+        json_str = re.sub(r",\s*}", "}", json_str)
+        json_str = re.sub(r",\s*\]", "]", json_str)
+        try:
+            data = json.loads(json_str)
+        except Exception:
+            print("[WARN] Failed to parse LLM JSON:", raw[:200], "...")
+            return {}
+
+    # ---- 3) Convert to {name: semantic_dict} format ----
+    result = {}
+    for col in data.get("columns", []):
+        name = col.get("name")
+        sem = col.get("semantic", {})
+        if name:
+            result[name] = sem
+
+    return result
+
+
+
+# -------------------------------------------------------------------
+# Build merged prompt for all selected columns
+# -------------------------------------------------------------------
+def _build_merged_prompt(columns: List[Dict[str, Any]]) -> str:
+    blocks = []
+    for col in columns:
+        name = col["name"]
+        coarse = col["coarse_type"]
+        examples = col.get("example_values", [])
+
+        # truncate huge examples
+        ex_list = []
+        for e in examples[:10]:
+            s = str(e)
+            if len(s) > 300:
+                s = s[:300] + "...[truncated]"
+            ex_list.append(s)
+
+        block = f"""
+Column name: {name}
+Coarse type: {coarse}
+Example values: {ex_list}
+"""
+        blocks.append(block)
+
+    column_blocks = "\n".join(blocks)
+    return MERGED_SEMANTIC_PROMPT.format(column_blocks=column_blocks)
+
+
+# -------------------------------------------------------------------
+# Main function: merged semantic profiling (ONE LLM CALL)
+# -------------------------------------------------------------------
+def build_semantic_profile(
+    csv_path: Path,
+    content_profile: Dict[str, Any],
+    title: str,
+    description: str,
+    topic: str,
+    max_semantic_columns: int = 5,
+) -> Dict[str, Any]:
+
+    # Step 1: select columns (same logic as before)
+    num_rows = max(1, content_profile.get("num_rows", 1))
+
+    # simple reuse: choose first `max_semantic_columns` non-ID-like columns
+    candidates = []
+    for col in content_profile["columns"]:
+        null_frac = col.get("null_fraction", 0.0)
+        nunique = col.get("num_unique", 0)
+        uniqueness_ratio = nunique / num_rows
+
+        too_sparse = null_frac >= 0.8
+        is_id_like = uniqueness_ratio > 0.9
+
+        if not too_sparse and not is_id_like:
+            candidates.append(col)
+
+    selected = candidates[:max_semantic_columns]
+
+    # Step 2: Build merged prompt
+    prompt = _build_merged_prompt(selected)
+
+    # Step 3: Call LLM ONCE
+    raw = call_llm(prompt, temperature=0.0)
+    parsed = _parse_multi_column_output(raw)
+
+    # Step 4: Construct output columns (preserve structure)
+    semantic_columns = []
+    for col in content_profile["columns"]:
+        name = col["name"]
+        examples = col.get("example_values", [])
+        coarse = col["coarse_type"]
+
+        if name in parsed:
+            sem = parsed[name]
+            profiled = True
+        else:
+            # fallback stub
+            sem = {
+                "is_temporal": False,
+                "temporal_resolution": "unknown",
+                "is_spatial": False,
+                "spatial_resolution": "unknown",
+                "entity_type": "unknown",
+                "domain_specific_type": "general",
+                "function_or_usage": "unknown",
+                "skipped_for_quota": True,
+            }
+            profiled = False
+
+        semantic_columns.append({
+            "name": name,
+            "coarse_type": coarse,
+            "example_values": examples,
+            "semantic": sem,
+            "semantic_profiled": profiled,
+        })
+
+    return {
+        "dataset_id": content_profile["dataset_id"],
+        "title": title,
+        "description": description,
+        "topic": topic,
+        "columns": semantic_columns,
+    }
+</file>
+
+<file path="check_models.py">
+"""
+File: src/check_models.py
+Description: 
+    This utility script lists all Google Gemini models available to your specific API Key.
+    Use this to verify which model versions (e.g., 'gemini-1.5-flash', 'gemini-2.0-flash') 
+    you have access to if you encounter '404 Not Found' errors.
+"""
+
+import os
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+# 1. Load Key
+load_dotenv()
+api_key = os.getenv("GEMINI_API_KEY")
+genai.configure(api_key=api_key)
+
+print("Querying all models supported by your API Key...\n")
+
+try:
+    # 2. List all models
+    count = 0
+    for m in genai.list_models():
+        # Only show models that support text generation
+        if 'generateContent' in m.supported_generation_methods:
+            print(f"Available model: {m.name}")
+            count += 1
+            
+    if count == 0:
+        print("  No models found that support generateContent.")
+    else:
+        print(f"\nFound {count} available models!")
+
+except Exception as e:
+    print(f" Query failed: {e}")
+</file>
+
+<file path="data_collector.py">
+"""
+File: src/data_collector.py
+Description: 
+    This script executes the "Bulk Data Collection" phase.
+    
+    Updates in this version:
+    Sorts by popularity (page_views) to get the most relevant datasets first.
+    
+    Usage: python src/data_collector.py
+"""
+
+import os
+import json
+import time
+import pandas as pd
+from sodapy import Socrata
+from dotenv import load_dotenv
+
+# --- Configuration ---
+TARGET_DATASET_COUNT = 2000   # Test with 20, then change to 2000
+DOWNLOAD_ROWS_LIMIT = 100   
+DATA_DIR = "../data/csv_files"
+METADATA_FILE = os.path.join(DATA_DIR, "metadata_registry.json")
+
+# 1. Load environment variables
+load_dotenv()
+SOCRATA_TOKEN = os.getenv("SOCRATA_APP_TOKEN")
+
+if not SOCRATA_TOKEN:
+    print("Error: SOCRATA_APP_TOKEN not found in .env file.")
+    exit()
+
+def collect_data():
+    print("-" * 50)
+    print(f" Starting Bulk Data Collection (Target: {TARGET_DATASET_COUNT})")
+    print(f"Strategy: Most Popular (Page Views Last Month)")
+    print("-" * 50)
+
+    client = Socrata("data.cityofnewyork.us", SOCRATA_TOKEN)
+    
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
+
+    # Load existing registry
+    registry = []
+    if os.path.exists(METADATA_FILE):
+        try:
+            with open(METADATA_FILE, 'r', encoding='utf-8') as f:
+                registry = json.load(f)
+            print(f" Loaded existing registry with {len(registry)} datasets.")
+        except:
+            registry = []
+
+    collected_count = len(registry)
+    page_size = 50
+    offset = 0
+
+    # Main Loop
+    while collected_count < TARGET_DATASET_COUNT:
+        print(f"\n Scanning catalog (Offset: {offset})...")
+        
+        try:
+            # Get a batch of datasets
+            # We order by popularity to ensure our sample is "representative" of usage
+            search_results = client.datasets(
+                limit=page_size, 
+                offset=offset, 
+                order="page_views_last_month DESC" 
+            )
+        except Exception as e:
+            # This catches the "Expected 50 got 11" error at the end of the list
+            print(f"  End of search results or API limitation reached: {e}")
+            break
+
+        if not search_results:
+            print("  No more datasets returned.")
+            break
+
+        processed_in_batch = 0
+
+        for item in search_results:
+            if collected_count >= TARGET_DATASET_COUNT:
+                break
+            
+            # The ID is nested in 'resource' for search results
+            dataset_id = item.get('resource', {}).get('id', item.get('id'))
+            
+            # Skip if already downloaded
+            if any(d['id'] == dataset_id for d in registry):
+                continue
+
+            try:
+                # === CRITICAL FIX ===
+                # The search result 'item' often lacks 'columns'.
+                # We MUST fetch the specific metadata for this ID to check if it's a table.
+                full_metadata = client.get_metadata(dataset_id)
+                
+                # 1. Filter: Must be Tabular (has columns)
+                if 'columns' not in full_metadata:
+                    # This is likely a map, a link, or a file, not a table
+                    continue
+                
+                name = full_metadata['name']
+                print(f"    [{collected_count + 1}/{TARGET_DATASET_COUNT}] Downloading: {name[:50]}...")
+
+                # 2. Download Data Sample
+                results = client.get(dataset_id, limit=DOWNLOAD_ROWS_LIMIT)
+                df = pd.DataFrame.from_records(results)
+                
+                if df.empty:
+                    print("        Skipped (Empty dataset)")
+                    continue
+
+                # 3. Save CSV
+                csv_filename = f"{dataset_id}.csv"
+                csv_path = os.path.join(DATA_DIR, csv_filename)
+                df.to_csv(csv_path, index=False)
+
+                # 4. Record Metadata
+                meta_entry = {
+                    "id": dataset_id,
+                    "name": name,
+                    "description": full_metadata.get("description", ""),
+                    "category": full_metadata.get("category", "Uncategorized"),
+                    "agency": full_metadata.get("attribution", "Unknown"),
+                    "columns": [col['name'] for col in full_metadata.get("columns", [])], 
+                    "local_path": csv_path,
+                    "sample_row_count": len(df),
+                    "page_views": item.get('page_views_last_month', 0) # Good for analysis
+                }
+                registry.append(meta_entry)
+                collected_count += 1
+                
+                # Save continuously
+                with open(METADATA_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(registry, f, indent=4)
+                    
+            except Exception as e:
+                # If fetch fails, just skip this dataset and move to next
+                # print(f"      Error processing {dataset_id}: {e}") # Uncomment to debug
+                pass
+            
+            processed_in_batch += 1
+
+        # If we went through a whole batch and found nothing valid, we still need to advance
+        offset += page_size
+        time.sleep(0.5) 
+
+    print("-" * 50)
+    print(f" Collection Complete!")
+    print(f" Total Datasets Collected: {collected_count}")
+    print("-" * 50)
+
+if __name__ == "__main__":
+    collect_data()
+</file>
+
+<file path="download_from_registry.py">
+"""
+File: src/download_from_registry.py
+Description: 
+    This script is for TEAMMATES to sync data.
+    It reads the 'metadata_registry.json' (committed to git) and downloads
+    any CSV files that are missing locally.
+    
+    Why? 
+    Because CSV files are gitignored. Teammates pull the registry but need 
+    to fetch the actual files to do their work.
+    
+    Usage: python src/download_from_registry.py
+"""
+
+import os
+import json
+import pandas as pd
+from sodapy import Socrata
+from dotenv import load_dotenv
+
+# --- Configuration ---
+DATA_DIR = "../outputs"
+METADATA_FILE = os.path.join(DATA_DIR, "metadata_registry.json")
+DOWNLOAD_ROWS_LIMIT = 100 
+
+# 1. Load environment variables
+load_dotenv()
+SOCRATA_TOKEN = os.getenv("SOCRATA_APP_TOKEN")
+
+if not SOCRATA_TOKEN:
+    print(" Error: SOCRATA_APP_TOKEN not found in .env file.")
+    exit()
+
+def sync_data_from_registry():
+    print("-" * 50)
+    print(" Starting Data Sync (Registry -> Local CSVs)")
+    print("-" * 50)
+
+    # Check if registry exists
+    if not os.path.exists(METADATA_FILE):
+        print(f" Error: {METADATA_FILE} not found.")
+        print("   Please pull from git or run 'data_collector.py' first.")
+        return
+
+    # Load Registry
+    with open(METADATA_FILE, 'r', encoding='utf-8') as f:
+        registry = json.load(f)
+    
+    print(f" Registry contains {len(registry)} datasets.")
+    
+    client = Socrata("data.cityofnewyork.us", SOCRATA_TOKEN)
+    
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
+
+    downloaded_count = 0
+    skipped_count = 0
+
+    for i, item in enumerate(registry):
+        dataset_id = item['id']
+        # Use the path from registry, or fallback to default naming
+        csv_filename = f"{dataset_id}.csv"
+        csv_path = os.path.join(DATA_DIR, csv_filename)
+        
+        # 1. Check if file already exists
+        if os.path.exists(csv_path):
+            # Optional: Check if file is empty? For now, just assume it's good.
+            skipped_count += 1
+            continue
+            
+        # 2. Download if missing
+        print(f"   [{i+1}/{len(registry)}] Restoring missing file: {item['name'][:50]}...")
+        
+        try:
+            results = client.get(dataset_id, limit=DOWNLOAD_ROWS_LIMIT)
+            df = pd.DataFrame.from_records(results)
+            
+            if df.empty:
+                print("      Warning: Dataset is empty on server.")
+                
+            df.to_csv(csv_path, index=False)
+            downloaded_count += 1
+            
+        except Exception as e:
+            print(f"       Failed to restore {dataset_id}: {e}")
+
+    print("-" * 50)
+    print(" Sync Complete!")
+    print(f"   - Existing files skipped: {skipped_count}")
+    print(f"   - Missing files downloaded: {downloaded_count}")
+    print("-" * 50)
+
+if __name__ == "__main__":
+    sync_data_from_registry()
+</file>
+
+<file path="evaluation/evaluator.py">
+import json
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# -----------------------------
+#   Load NDCG JSON
+# -----------------------------
+def load_ndcg(ndcg_path="ndcg_eval_results.json"):
+    with open(ndcg_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# -----------------------------
+#   Load text_eval JSONL
+# -----------------------------
+def load_text_eval(path="text_eval_results.jsonl"):
+    records = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                records.append(json.loads(line))
+    return records
+
+
+# -----------------------------
+#   Aggregate text_eval
+# -----------------------------
+def aggregate_text_eval(records):
+    methods = ["original", "hs", "ufd", "ufd_nyc", "sfd", "sfd_nyc"]
+
+    summary = {m: {"completeness": [], "conciseness": [], "readability": [], "faithfulness": []}
+               for m in methods}
+
+    for row in records:
+        for m in methods:
+            ref_free = row.get(m, {}).get("ref_free", {})
+            for k in summary[m]:
+                v = ref_free.get(k)
+                if v is not None:
+                    summary[m][k].append(v)
+
+    # compute mean
+    for m in methods:
+        for k in summary[m]:
+            arr = summary[m][k]
+            summary[m][k] = float(np.mean(arr)) if arr else None
+
+    return summary
+
+
+# -----------------------------
+#   Radar plot
+# -----------------------------
+def make_radar_plot(text_summary, ndcg_summary, out_path="../../outputs/eval_radar.png"):
+
+    labels = [
+        "Lexical Matching (BM25)",
+        "Completeness",
+        "Conciseness",
+        "Readability",
+        "Faithfulness"
+    ]
+
+    def metrics_normalized(method):
+        """Return metrics normalized to [0,1]."""
+        return [
+            ndcg_summary[method]["bm25@20"],                  # Already in 0–1
+            text_summary[method]["completeness"] / 10.0,      # Normalize
+            text_summary[method]["conciseness"] / 10.0,
+            text_summary[method]["readability"] / 10.0,
+            text_summary[method]["faithfulness"] / 10.0,
+        ]
+
+    methods = ["original", "hs", "ufd", "ufd_nyc", "sfd", "sfd_nyc"]
+    method_names = {
+        "original": "Original",
+        "hs": "H&S",
+        "ufd": "UFD",
+        "ufd_nyc": "UFD-NYC",
+        "sfd": "SFD",
+        "sfd_nyc": "SFD-NYC"
+    }
+
+    num_vars = len(labels)
+    angles = np.linspace(0, 2*np.pi, num_vars, endpoint=False).tolist()
+    angles += angles[:1]
+
+    plt.figure(figsize=(9, 9))
+    ax = plt.subplot(111, polar=True)
+
+    for m in methods:
+        vals = metrics_normalized(m)
+        vals = [0 if v is None else v for v in vals]
+        vals += vals[:1]
+
+        ax.plot(angles, vals, label=method_names[m], linewidth=2)
+        ax.fill(angles, vals, alpha=0.12)
+
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(labels, fontsize=12)
+    ax.set_yticklabels([])
+
+    # annotation
+    plt.text(0.5, -0.15, "Scores normalized to [0, 1]", transform=ax.transAxes,
+             ha="center", fontsize=12)
+
+    plt.legend(loc="upper right", bbox_to_anchor=(1.25, 1.1))
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    print(f"[SAVED] Radar plot → {out_path}")
+
+
+# -----------------------------
+#   Save metrics table (normalized)
+# -----------------------------
+def save_metrics_table(text_summary, ndcg_summary, out_path="../../outputs/eval_results.json"):
+    out = {}
+    methods = ["original", "hs", "ufd", "ufd_nyc", "sfd", "sfd_nyc"]
+
+    for m in methods:
+        out[m] = {
+            "lexical_matching_bm25": round(ndcg_summary[m]["bm25@20"], 4),
+            "completeness": round(text_summary[m]["completeness"] / 10.0, 4),
+            "conciseness": round(text_summary[m]["conciseness"] / 10.0, 4),
+            "readability": round(text_summary[m]["readability"] / 10.0, 4),
+            "faithfulness": round(text_summary[m]["faithfulness"] / 10.0, 4),
+        }
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2)
+
+    print(f"[SAVED] Metrics table → {out_path}")
+
+
+# -----------------------------
+#   Main
+# -----------------------------
+if __name__ == "__main__":
+
+    ndcg = load_ndcg("ndcg_eval_results.json")
+    text_records = load_text_eval("text_eval_results.jsonl")
+
+    text_summary = aggregate_text_eval(text_records)
+
+    make_radar_plot(text_summary, ndcg)
+
+    save_metrics_table(text_summary, ndcg)
+</file>
+
+<file path="evaluation/get_ndcg_ground_truth.py">
+"""
+File: run_relevance_auto_csv.py
+
+Description:
+    Generate a relevance matrix (datasets × queries) using Gemini 2.5 flash.
+    LLM sees more metadata: category, agency, columns, description, etc.
+
+Output:
+    relevance_matrix.csv
+"""
+import random
+import os
+import csv
+import json
+from dotenv import load_dotenv
+import google.generativeai as genai
+
+# ============================================================
+#                 LOAD API KEY & CONFIGURE MODEL
+# ============================================================
+
+load_dotenv()
+api_key = os.getenv("GEMINI_API_KEY")
+if not api_key:
+    raise ValueError("GEMINI_API_KEY not found in .env")
+
+genai.configure(api_key=api_key)
+MODEL_NAME = "gemini-2.5-flash"
+
+
+# ============================================================
+#            STEP 1 — LOAD METADATA & PICK DATASETS
+# ============================================================
+
+def load_metadata(path="../../outputs/metadata_registry.json"):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def choose_datasets(metadata, target_count=50, seed=42):
+    """
+    Deterministic random selection:
+        - Shuffle metadata using a fixed seed
+        - Take first target_count
+        - Fully reproducible
+    """
+    random.seed(seed)
+    shuffled = metadata[:]        # copy
+    random.shuffle(shuffled)
+    return shuffled[:target_count]
+
+
+# ============================================================
+#          STEP 2 — GENERATE 20 DETERMINISTIC QUERIES
+# ============================================================
+
+def generate_queries(metadata=None, num_queries=20):
+
+    queries = []
+    with open("queries.txt", "r", encoding="utf-8") as f:
+        queries = [line.strip() for line in f]
+
+    return queries[:num_queries]
+
+
+
+# ============================================================
+#                STEP 3 — GEMINI RELEVANCE JUDGE
+# ============================================================
+
+JUDGE_PROMPT = """
+You are rating whether a dataset in NYC open data is relevant to a user query.
+
+Return ONLY one character:
+0 = not relevant
+1 = partially relevant
+2 = highly relevant
+
+Return ONLY: 0 or 1 or 2
+Do NOT return any words, explanations, or JSON.
+"""
+
+def judge_relevance(query, ds):
+    """LLM sees full metadata: name, description, category, agency, columns."""
+
+    name = ds.get("name", "")
+    desc = ds.get("description", "")
+    category = ds.get("category", "")
+    agency = ds.get("agency", "")
+    columns = ds.get("columns", [])
+
+    metadata_text = f"""
+Dataset Name: {name}
+Category: {category}
+Agency: {agency}
+Columns: {', '.join(columns)}
+
+Description:
+{desc}
+"""
+
+    model = genai.GenerativeModel(MODEL_NAME)
+
+    user_prompt = f"""
+Query:
+{query}
+
+Dataset Metadata:
+{metadata_text}
+
+Rate relevance: output only 0 or 1 or 2.
+"""
+
+    resp = model.generate_content(
+        JUDGE_PROMPT + "\n\n" + user_prompt,
+        generation_config={
+            "temperature": 0,
+            "response_mime_type": "text/plain"   # ensure single-digit output
+        }
+    )
+
+    text = resp.text.strip()
+
+    # extract single digit
+    digits = [c for c in text if c in "012"]
+    if not digits:
+        return 0
+    return int(digits[0])
+
+
+# ============================================================
+#                        MAIN LOOP
+# ============================================================
+
+def main():
+    metadata = load_metadata()
+    selected = choose_datasets(metadata, target_count=50)
+    queries = generate_queries(metadata, num_queries=20)
+
+    print(f"Selected datasets: {len(selected)}")
+    print(f"Generated queries: {len(queries)}")
+
+    output_path = "relevance_matrix.csv"
+
+    header = ["dataset_id"] + [f"query_{i+1}" for i in range(len(queries))]
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+
+        for ds in selected:
+            dsid = ds["id"]
+            print(f"\n===== DATASET {dsid} =====")
+            print(f" Description: {ds['description']}")
+            print(f"\n==========================")
+            row = [dsid]
+
+            for i, query in enumerate(queries):
+                print(f"  Query {i+1}: {query}")
+                score = judge_relevance(query, ds)
+                row.append(score)
+
+                print(f"    → relevance = {score}")
+
+            writer.writerow(row)
+
+    print(f"\nDone! Saved to {output_path}\n")
+
+
+# ============================================================
+# Start
+# ============================================================
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="evaluation/ndcg_eval_results.json">
+{
+  "hs": {
+    "bm25@10": 0.39907291118574134,
+    "bm25@20": 0.442662753901495
+  },
+  "ufd": {
+    "bm25@10": 0.4607529561667711,
+    "bm25@20": 0.5010677072667635
+  },
+  "sfd": {
+    "bm25@10": 0.5537461624622001,
+    "bm25@20": 0.5927548751156616
+  },
+  "ufd_nyc": {
+    "bm25@10": 0.4607529561667711,
+    "bm25@20": 0.5010677072667635
+  },
+  "sfd_nyc": {
+    "bm25@10": 0.5537461624622001,
+    "bm25@20": 0.5927548751156616
+  },
+  "original": {
+    "bm25@10": 0.4025647166322314,
+    "bm25@20": 0.42905302903020565
+  }
+}
+</file>
+
+<file path="evaluation/ndcg_eval.py">
+"""
+Standalone NDCG evaluator for AutoDDG (BM25 only).
+
+Reads:
+    - baseline JSONL (descriptions)
+    - metadata JSON (original descriptions)
+    - queries.txt
+    - relevance_matrix.csv
+
+Computes BM25 NDCG@10 and @20 for:
+    hs, ufd, sfd, ufd_nyc, sfd_nyc, original
+
+Outputs:
+    ndcg_results.json
+"""
+
+import json
+import math
+from typing import Dict, List
+import pandas as pd
+from collections import Counter
+
+
+# ======================================
+#  Utils: DCG / NDCG
+# ======================================
+
+def dcg(scores: List[int], k: int) -> float:
+    s = scores[:k]
+    return sum((rel / math.log2(i + 2)) for i, rel in enumerate(s))
+
+
+def ndcg(scores: List[int], k: int) -> float:
+    if not scores:
+        return 0.0
+    ideal = sorted(scores, reverse=True)
+    d_ideal = dcg(ideal, k)
+    return dcg(scores, k) / d_ideal if d_ideal > 0 else 0.0
+
+
+# ======================================
+#  BM25 Implementation
+# ======================================
+
+def bm25_score(query_tokens, doc_tokens, avgdl, N, doc_freq, k1=1.5, b=0.75):
+    score = 0.0
+    tf = Counter(doc_tokens)
+    doc_len = len(doc_tokens)
+
+    for term in query_tokens:
+        if term not in tf:
+            continue
+        df = doc_freq.get(term, 0)
+        idf = math.log((N - df + 0.5) / (df + 0.5) + 1)
+        score += idf * ((tf[term] * (k1 + 1)) /
+                        (tf[term] + k1 * (1 - b + b * (doc_len / avgdl))))
+    return score
+
+
+def bm25_rank(query: str, documents: Dict[str, str]) -> List[str]:
+    q_toks = query.lower().split()
+    tok_docs = {k: v.lower().split() for k, v in documents.items()}
+
+    N = len(tok_docs)
+    avgdl = sum(len(t) for t in tok_docs.values()) / N
+
+    doc_freq = {}
+    for tks in tok_docs.values():
+        for term in set(tks):
+            doc_freq[term] = doc_freq.get(term, 0) + 1
+
+    scored = []
+    for ds_id, toks in tok_docs.items():
+        s = bm25_score(q_toks, toks, avgdl, N, doc_freq)
+        scored.append((ds_id, s))
+
+    return [ds for ds, _ in sorted(scored, key=lambda x: x[1], reverse=True)]
+
+
+# ======================================
+#  NDCG for one method
+# ======================================
+
+def compute_ndcg_for_method(
+    queries: List[str],
+    dataset_records: Dict[str, Dict[str, str]],
+    relevance: Dict[str, Dict[str, int]],
+    method_col: str,
+    k: int,
+):
+    ndcg_scores = []
+
+    for qi, q in enumerate(queries, start=1):
+        docs = {ds: dataset_records[ds].get(method_col, "") for ds in dataset_records}
+        ranked = bm25_rank(q, docs)
+
+        rel_scores = [
+            relevance.get(f"query_{qi}", {}).get(ds, 0)
+            for ds in ranked
+        ]
+
+        ndcg_scores.append(ndcg(rel_scores, k))
+
+    return sum(ndcg_scores) / len(ndcg_scores)
+
+
+# ======================================
+#  Main Pipeline
+# ======================================
+
+def run_ndcg_evaluation(
+    baseline_jsonl: str,
+    metadata_json: str,      # ← NEW
+    queries_txt: str,
+    relevance_csv: str,
+    output_json: str,
+):
+    # ----------------------------------------------------
+    # Load metadata JSON (original descriptions)
+    # ----------------------------------------------------
+    with open(metadata_json, "r", encoding="utf-8") as f:
+        metadata = json.load(f)
+
+    original_map = {item["id"]: item.get("description", "") for item in metadata}
+
+    # ----------------------------------------------------
+    # Load baseline JSONL
+    # ----------------------------------------------------
+    dataset_records = {}
+
+    with open(baseline_jsonl, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            ds = rec["dataset_id"]
+
+            dataset_records[ds] = {
+                "hs": rec.get("HandS", ""),
+                "ufd": rec.get("ufd", ""),
+                "sfd": rec.get("sfd", ""),
+                "ufd_nyc": rec.get("ufd_nyc", ""),
+                "sfd_nyc": rec.get("sfd_nyc", ""),
+                "original": original_map.get(ds, "")  # ← correct source
+            }
+
+    baseline_ids = set(dataset_records.keys())
+
+    # ----------------------------------------------------
+    # Load queries
+    # ----------------------------------------------------
+    with open(queries_txt, "r", encoding="utf-8") as f:
+        queries = [q.strip() for q in f if q.strip()]
+
+    # ----------------------------------------------------
+    # Load relevance
+    # ----------------------------------------------------
+    rel_df = pd.read_csv(relevance_csv)
+    rel_ids = set(rel_df["dataset_id"].astype(str))
+
+    if not rel_ids.issubset(baseline_ids):
+        missing = rel_ids - baseline_ids
+        print("[WARNING] baseline JSONL does NOT contain all dataset_ids from relevance CSV.")
+        print(f"Missing count: {len(missing)}")
+        print(f"Example missing: {list(missing)[:10]}\n")
+
+    relevance = {}
+    for col in rel_df.columns:
+        if col == "dataset_id":
+            continue
+        qid = col
+        relevance[qid] = {}
+        for _, row in rel_df.iterrows():
+            relevance[qid][str(row["dataset_id"])] = int(row[col])
+
+    # ----------------------------------------------------
+    # Compute NDCG (BM25 only)
+    # ----------------------------------------------------
+    methods = ["hs", "ufd", "sfd", "ufd_nyc", "sfd_nyc", "original"]
+    results = {}
+
+    for m in methods:
+        print(f"Computing {m} ...")
+        ndcg10 = compute_ndcg_for_method(queries, dataset_records, relevance, m, 10)
+        ndcg20 = compute_ndcg_for_method(queries, dataset_records, relevance, m, 20)
+
+        results[m] = {
+            "bm25@10": ndcg10,
+            "bm25@20": ndcg20,
+        }
+
+    # ----------------------------------------------------
+    # Save final output
+    # ----------------------------------------------------
+    with open(output_json, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+
+    print("\nSaved NDCG results →", output_json)
+
+
+# ======================================
+#  CLI
+# ======================================
+
+if __name__ == "__main__":
+    run_ndcg_evaluation(
+        baseline_jsonl="../../outputs/baseline_autoddg_descriptions.jsonl",
+        metadata_json="../../outputs/metadata_registry.json",
+        queries_txt="queries.txt",
+        relevance_csv="relevance_matrix.csv",
+        output_json="ndcg_eval_results.json"
+    )
+</file>
+
+<file path="evaluation/queries.txt">
+NYC taxi, for-hire vehicle, or transportation trip statistics
+City employee payroll, overtime, or workforce compensation data
+NYC crime, public safety, or emergency response statistics
+Housing inspections, violations, or landlord-tenant records
+311 service requests or complaint trends across neighborhoods
+Building permits, land use, zoning, or construction activity
+Environmental measurements such as air quality or noise levels
+School performance, enrollment, or educational program data
+Restaurant inspections, food safety, or health violations
+Social services usage, benefits programs, or demographic trends
+Traffic collisions, traffic volume, or street safety indicators
+Parks maintenance, recreation program, or facility inspections
+City budget, financial transparency, or spending reports
+Public transit operations, ridership, or service reliability
+Water usage, infrastructure, sewer, or utility system data
+Business licenses, permits, or economic development records
+Fire department operations, incidents, or inspection results
+Elections, civic engagement, or public participation statistics
+Waste collection, recycling, or sanitation performance metrics
+Public health outcomes, disease surveillance, or hospital data
+</file>
+
+<file path="evaluation/readme.txt">
+11/27 Han Yang
+
+我关于baseline的更新：
+1. 我更改了baseline_autoddg.py，我加了header+sample(在baseline...json里的HandS列)这种描述方法，
+它是通过给llm 列名和样例行，让llm直接生成一个短描述，这可以用来和autoddg生成的描述做对比。我也把SAMPLE, CONTENT, SEMANTIC这些原本的中间结果都存到输出json了，因为它们是后续evaluation中faithfulness的必要信息。
+2. (重要) 我在baseline_autoddg.py的输出列里加了ufd_nyc和sfd_nyc用于接收autoddg-nyc的描述，但目前它和ufd和sfd一样，只是dummy列。
+当开始做nyc特化prompt (week3任务)时，请在baseline里添加特化逻辑，然后把特化后的描述赋值给ufd_nyc和sfd_nyc，否则evaluation的pipeline无法正确生成相关评分。
+3. 我还在baseline_autoddg.py的主函数run_baseline_autoddg里面加了个test_mode参数，设为False是原来的行为，设为True则只生成指定的50个数据集的描述json，方便快速测试。
+4. 另外，我更改了baseline/semantic_autoddg.py。我从每个列都调用一次llm做语义概述，改成了所有列一起给llm，总共调用一次。这显著增加了效率，但如果数据集列数过多，可能降低llm表现。
+5. 最后，文件结构做了点小改动，数据集的csv都在data/csv_files里，outputs存有所有的主要结果，比如baseline的输出文件，评估的输出文件和metadata_registry.json。
+
+
+背景（不重要）：
+论文总共提到了三种评估metrics:
+ndcg：给定一个查询和ground truth，通过bm25 （Splade没用，因为太慢）按照每个数据集描述与查询的匹配度对数据集排序，排序与ground truth（真实排序）越接近，说明该生成数据集描述的方法越好
+reference_free：无参考评估，即不需要除描述外的其它信息进行评估。通过LLM直接根据数据集描述评估completeness, conciseness, readability，通过给SAMPLE, CONTENT, SEMANTIC和描述信息来评估faithfulness(是否有幻觉)，所有分数都是0-10,最终结果归一化成0-1。
+similarity：评估不同方法生成的描述与人类描述（原始描述）的相似性。指标有rouge等，这个评估没什么意义。
+
+
+关于评估的重要说明：评估所需的输入文件就是baseline_autoddg_description.jsonl和metadata_registry.json，
+text_eval.py (功能见下方文件说明)其实不需要baseline...json的全部2000个数据集描述，200个差不多就够了，只要有代表性，当然2000个也行。
+ndcg_eval.py 则特殊一些，它要且仅要50个指定的数据集，所以你要么把baseline跑完让它从2000个里自动找，要么把baseline_autoddg.py里的test_mode打开，
+指定生成这50个数据集的描述（你可以之后再关掉下载剩余的）。
+
+所以如果你在测试不同的nyc特化prompt，你就让test_mode开着，改完一次，跑这50个数据集的描述，然后跑evaluator.py看表现，如此循环。
+当你有一个最终特化版本后，再跑2000个，reference_free和similarity的评分会更精确一点。
+如果你是第一次跑，ntlk可能会报错，因为有些nltk有些东西要一次性下载下。应该是下面这几个
+nltk.download("punkt")
+nltk.download("wordnet")
+nltk.download("omw-1.4")
+
+
+快速使用：
+python evaluator.py，生成的结果在outputs里。eval_radar.png和论文里的雷达图类似，eval_results.json是文本结果。
+
+
+文件说明：
+text_eval.py -> 实现reference_free和similarity的评估，结果文件是text_eval_results.jsonl
+ndcg_eval.py -> 实现ndcg的评估，结果文件是ndcg_eval_results.json
+python evaluator.py -> 调用text_eval.py和ndcg_eval.py，一键生成结果到outputs folder里
+
+queries.txt -> 有代表性的20个查询
+get_ndcg_ground_truth.py -> 让llm自动评判数据集对给定查询是否有相关性（0，1，2代表不相关，部分相关和相关），即生成ndcg的ground truth。
+relevance_matrix.csv -> get_ndcg_ground_truth.py的输出文件，包含了50个有代表性的数据集和20个查询，这个用来做ground truth，用于后续NDCG打分。
+</file>
+
+<file path="evaluation/text_eval_results.jsonl">
+{"dataset_id": "5zyy-y8am", "hs": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.13907826949162067, "rouge1": 0.22999999999999998, "rouge2": 0.030303030303030304, "rougeL": 0.1, "bertscore_precision": 0.8243033289909363, "bertscore_recall": 0.7837117910385132, "bertscore_f1": 0.8034952878952026}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.24015584936994147, "rouge1": 0.3595505617977528, "rouge2": 0.09056603773584906, "rougeL": 0.20224719101123595, "bertscore_precision": 0.8358200788497925, "bertscore_recall": 0.8096703886985779, "bertscore_f1": 0.8225374221801758}}, "sfd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.19169348077492615, "rouge1": 0.26625386996904027, "rouge2": 0.04984423676012461, "rougeL": 0.1486068111455108, "bertscore_precision": 0.804686427116394, "bertscore_recall": 0.7983264923095703, "bertscore_f1": 0.8014938235282898}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.24015584936994147, "rouge1": 0.3595505617977528, "rouge2": 0.09056603773584906, "rougeL": 0.20224719101123595, "bertscore_precision": 0.8358200788497925, "bertscore_recall": 0.8096703886985779, "bertscore_f1": 0.8225374221801758}}, "sfd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.19169348077492615, "rouge1": 0.26625386996904027, "rouge2": 0.04984423676012461, "rougeL": 0.1486068111455108, "bertscore_precision": 0.804686427116394, "bertscore_recall": 0.7983264923095703, "bertscore_f1": 0.8014938235282898}}, "original": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "jr24-e7cr", "hs": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.24561403508771934, "rouge1": 0.2201834862385321, "rouge2": 0.0, "rougeL": 0.11009174311926605, "bertscore_precision": 0.784256100654602, "bertscore_recall": 0.8960093855857849, "bertscore_f1": 0.836416482925415}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2985160423078284, "rouge1": 0.19875776397515527, "rouge2": 0.0880503144654088, "rougeL": 0.17391304347826086, "bertscore_precision": 0.8088487386703491, "bertscore_recall": 0.921229362487793, "bertscore_f1": 0.8613891005516052}}, "sfd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.26713358657803105, "rouge1": 0.18079096045197737, "rouge2": 0.06857142857142857, "rougeL": 0.1581920903954802, "bertscore_precision": 0.7815244793891907, "bertscore_recall": 0.8972700834274292, "bertscore_f1": 0.8354071378707886}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2985160423078284, "rouge1": 0.19875776397515527, "rouge2": 0.0880503144654088, "rougeL": 0.17391304347826086, "bertscore_precision": 0.8088487386703491, "bertscore_recall": 0.921229362487793, "bertscore_f1": 0.8613891005516052}}, "sfd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.26713358657803105, "rouge1": 0.18079096045197737, "rouge2": 0.06857142857142857, "rougeL": 0.1581920903954802, "bertscore_precision": 0.7815244793891907, "bertscore_recall": 0.8972700834274292, "bertscore_f1": 0.8354071378707886}}, "original": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "c23c-uwsm", "hs": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.07016248153618906, "rouge1": 0.1794871794871795, "rouge2": 0.07792207792207792, "rougeL": 0.14102564102564102, "bertscore_precision": 0.8610328435897827, "bertscore_recall": 0.7860229015350342, "bertscore_f1": 0.8218198418617249}}, "ufd": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2677764677236559, "rouge1": 0.4780876494023904, "rouge2": 0.18473895582329317, "rougeL": 0.22310756972111553, "bertscore_precision": 0.8765128254890442, "bertscore_recall": 0.8389329314231873, "bertscore_f1": 0.8573112487792969}}, "sfd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2809235021710655, "rouge1": 0.3839009287925697, "rouge2": 0.11838006230529594, "rougeL": 0.18575851393188855, "bertscore_precision": 0.8093547224998474, "bertscore_recall": 0.8246698379516602, "bertscore_f1": 0.8169404864311218}}, "ufd_nyc": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2677764677236559, "rouge1": 0.4780876494023904, "rouge2": 0.18473895582329317, "rougeL": 0.22310756972111553, "bertscore_precision": 0.8765128254890442, "bertscore_recall": 0.8389329314231873, "bertscore_f1": 0.8573112487792969}}, "sfd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2809235021710655, "rouge1": 0.3839009287925697, "rouge2": 0.11838006230529594, "rougeL": 0.18575851393188855, "bertscore_precision": 0.8093547224998474, "bertscore_recall": 0.8246698379516602, "bertscore_f1": 0.8169404864311218}}, "original": {"ref_free": {"completeness": 7, "conciseness": 6, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "hgx4-8ukb", "hs": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.09341998375304629, "rouge1": 0.18867924528301883, "rouge2": 0.006329113924050633, "rougeL": 0.0880503144654088, "bertscore_precision": 0.8182686567306519, "bertscore_recall": 0.7617825865745544, "bertscore_f1": 0.7890159487724304}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.19918468268280912, "rouge1": 0.398936170212766, "rouge2": 0.10695187165775401, "rougeL": 0.16489361702127658, "bertscore_precision": 0.8400518894195557, "bertscore_recall": 0.7986171841621399, "bertscore_f1": 0.818810760974884}}, "sfd": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.23628408787137242, "rouge1": 0.39803439803439805, "rouge2": 0.09876543209876543, "rougeL": 0.1769041769041769, "bertscore_precision": 0.8270920515060425, "bertscore_recall": 0.788857638835907, "bertscore_f1": 0.8075225353240967}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.19918468268280912, "rouge1": 0.398936170212766, "rouge2": 0.10695187165775401, "rougeL": 0.16489361702127658, "bertscore_precision": 0.8400518894195557, "bertscore_recall": 0.7986171841621399, "bertscore_f1": 0.818810760974884}}, "sfd_nyc": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.23628408787137242, "rouge1": 0.39803439803439805, "rouge2": 0.09876543209876543, "rougeL": 0.1769041769041769, "bertscore_precision": 0.8270920515060425, "bertscore_recall": 0.788857638835907, "bertscore_f1": 0.8075225353240967}}, "original": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "p48c-iqtu", "hs": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.03992015968063872, "rouge1": 0.09417040358744395, "rouge2": 0.009009009009009009, "rougeL": 0.04484304932735426, "bertscore_precision": 0.813781201839447, "bertscore_recall": 0.7717769145965576, "bertscore_f1": 0.7922226190567017}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.16060879144329213, "rouge1": 0.3553875236294896, "rouge2": 0.11764705882352941, "rougeL": 0.166351606805293, "bertscore_precision": 0.8832945227622986, "bertscore_recall": 0.8288543224334717, "bertscore_f1": 0.8552088737487793}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.15288035099991107, "rouge1": 0.31021897810218974, "rouge2": 0.07692307692307691, "rougeL": 0.1386861313868613, "bertscore_precision": 0.8276854753494263, "bertscore_recall": 0.8167975544929504, "bertscore_f1": 0.8222054839134216}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.16060879144329213, "rouge1": 0.3553875236294896, "rouge2": 0.11764705882352941, "rougeL": 0.166351606805293, "bertscore_precision": 0.8832945227622986, "bertscore_recall": 0.8288543224334717, "bertscore_f1": 0.8552088737487793}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.15288035099991107, "rouge1": 0.31021897810218974, "rouge2": 0.07692307692307691, "rougeL": 0.1386861313868613, "bertscore_precision": 0.8276854753494263, "bertscore_recall": 0.8167975544929504, "bertscore_f1": 0.8222054839134216}}, "original": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "dx8z-6nev", "hs": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.2164700875669622, "rouge1": 0.4158415841584158, "rouge2": 0.13, "rougeL": 0.22772277227722773, "bertscore_precision": 0.8636175394058228, "bertscore_recall": 0.8269007802009583, "bertscore_f1": 0.8448603749275208}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.30317388716836796, "rouge1": 0.5210727969348659, "rouge2": 0.18532818532818532, "rougeL": 0.2222222222222222, "bertscore_precision": 0.8748036623001099, "bertscore_recall": 0.8537089824676514, "bertscore_f1": 0.8641275763511658}}, "sfd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2658995815899582, "rouge1": 0.3592814371257485, "rouge2": 0.10240963855421686, "rougeL": 0.17365269461077845, "bertscore_precision": 0.8011417984962463, "bertscore_recall": 0.8289270401000977, "bertscore_f1": 0.814797580242157}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.30317388716836796, "rouge1": 0.5210727969348659, "rouge2": 0.18532818532818532, "rougeL": 0.2222222222222222, "bertscore_precision": 0.8748036623001099, "bertscore_recall": 0.8537089824676514, "bertscore_f1": 0.8641275763511658}}, "sfd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2658995815899582, "rouge1": 0.3592814371257485, "rouge2": 0.10240963855421686, "rougeL": 0.17365269461077845, "bertscore_precision": 0.8011417984962463, "bertscore_recall": 0.8289270401000977, "bertscore_f1": 0.814797580242157}}, "original": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}}}
+{"dataset_id": "xmmq-y7za", "hs": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.15641945001179355, "rouge1": 0.22988505747126436, "rouge2": 0.03488372093023256, "rougeL": 0.14942528735632185, "bertscore_precision": 0.8350253105163574, "bertscore_recall": 0.8118179440498352, "bertscore_f1": 0.823258101940155}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.321501878328151, "rouge1": 0.3507462686567164, "rouge2": 0.11278195488721805, "rougeL": 0.20149253731343283, "bertscore_precision": 0.8378714323043823, "bertscore_recall": 0.8341037631034851, "bertscore_f1": 0.835983395576477}}, "sfd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.25144512976371386, "rouge1": 0.26747720364741645, "rouge2": 0.09174311926605504, "rougeL": 0.15805471124620063, "bertscore_precision": 0.7991935014724731, "bertscore_recall": 0.817803144454956, "bertscore_f1": 0.8083912134170532}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.321501878328151, "rouge1": 0.3507462686567164, "rouge2": 0.11278195488721805, "rougeL": 0.20149253731343283, "bertscore_precision": 0.8378714323043823, "bertscore_recall": 0.8341037631034851, "bertscore_f1": 0.835983395576477}}, "sfd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.25144512976371386, "rouge1": 0.26747720364741645, "rouge2": 0.09174311926605504, "rougeL": 0.15805471124620063, "bertscore_precision": 0.7991935014724731, "bertscore_recall": 0.817803144454956, "bertscore_f1": 0.8083912134170532}}, "original": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "8n8s-np59", "hs": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.10061242344706911, "rouge1": 0.0392156862745098, "rouge2": 0.0, "rougeL": 0.0392156862745098, "bertscore_precision": 0.7851159572601318, "bertscore_recall": 0.8254017233848572, "bertscore_f1": 0.8047549724578857}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.5935299295774649, "rouge1": 0.2916666666666667, "rouge2": 0.2676056338028169, "rougeL": 0.2916666666666667, "bertscore_precision": 0.8349270224571228, "bertscore_recall": 0.9510986804962158, "bertscore_f1": 0.8892346024513245}}, "sfd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.481045751633987, "rouge1": 0.2282608695652174, "rouge2": 0.20879120879120877, "rougeL": 0.2282608695652174, "bertscore_precision": 0.7850924134254456, "bertscore_recall": 0.9275477528572083, "bertscore_f1": 0.8503954410552979}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.5935299295774649, "rouge1": 0.2916666666666667, "rouge2": 0.2676056338028169, "rougeL": 0.2916666666666667, "bertscore_precision": 0.8349270224571228, "bertscore_recall": 0.9510986804962158, "bertscore_f1": 0.8892346024513245}}, "sfd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.481045751633987, "rouge1": 0.2282608695652174, "rouge2": 0.20879120879120877, "rougeL": 0.2282608695652174, "bertscore_precision": 0.7850924134254456, "bertscore_recall": 0.9275477528572083, "bertscore_f1": 0.8503954410552979}}, "original": {"ref_free": {"completeness": 6, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "s3k6-pzi2", "hs": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.07507507507507508, "rouge1": 0.031578947368421054, "rouge2": 0.0, "rougeL": 0.021052631578947368, "bertscore_precision": 0.7461375594139099, "bertscore_recall": 0.8496748208999634, "bertscore_f1": 0.794547438621521}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.1730769230769231, "rouge1": 0.10062893081761005, "rouge2": 0.06369426751592357, "rougeL": 0.0880503144654088, "bertscore_precision": 0.7872881889343262, "bertscore_recall": 0.9092804193496704, "bertscore_f1": 0.843898355960846}}, "sfd": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.1470588235294118, "rouge1": 0.0945945945945946, "rouge2": 0.04109589041095891, "rougeL": 0.06756756756756756, "bertscore_precision": 0.7628476023674011, "bertscore_recall": 0.8952049016952515, "bertscore_f1": 0.8237434029579163}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.1730769230769231, "rouge1": 0.10062893081761005, "rouge2": 0.06369426751592357, "rougeL": 0.0880503144654088, "bertscore_precision": 0.7872881889343262, "bertscore_recall": 0.9092804193496704, "bertscore_f1": 0.843898355960846}}, "sfd_nyc": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.1470588235294118, "rouge1": 0.0945945945945946, "rouge2": 0.04109589041095891, "rougeL": 0.06756756756756756, "bertscore_precision": 0.7628476023674011, "bertscore_recall": 0.8952049016952515, "bertscore_f1": 0.8237434029579163}}, "original": {"ref_free": {"completeness": 2, "conciseness": 9, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "2jpd-hixn", "hs": {"ref_free": {"completeness": 6, "conciseness": 8, "readability": 7, "faithfulness": 10}, "similarity": {"meteor": 0.15283842794759828, "rouge1": 0.20338983050847456, "rouge2": 0.0, "rougeL": 0.13559322033898305, "bertscore_precision": 0.8474554419517517, "bertscore_recall": 0.862845778465271, "bertscore_f1": 0.8550813794136047}}, "ufd": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.5178125000000001, "rouge1": 0.27142857142857146, "rouge2": 0.24637681159420294, "rougeL": 0.24285714285714285, "bertscore_precision": 0.8250874280929565, "bertscore_recall": 0.9377212524414062, "bertscore_f1": 0.8778060078620911}}, "sfd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.3617546657712863, "rouge1": 0.18556701030927836, "rouge2": 0.125, "rougeL": 0.16494845360824742, "bertscore_precision": 0.7967420220375061, "bertscore_recall": 0.8851246237754822, "bertscore_f1": 0.8386110663414001}}, "ufd_nyc": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.5178125000000001, "rouge1": 0.27142857142857146, "rouge2": 0.24637681159420294, "rougeL": 0.24285714285714285, "bertscore_precision": 0.8250874280929565, "bertscore_recall": 0.9377212524414062, "bertscore_f1": 0.8778060078620911}}, "sfd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.3617546657712863, "rouge1": 0.18556701030927836, "rouge2": 0.125, "rougeL": 0.16494845360824742, "bertscore_precision": 0.7967420220375061, "bertscore_recall": 0.8851246237754822, "bertscore_f1": 0.8386110663414001}}, "original": {"ref_free": {"completeness": 6, "conciseness": 7, "readability": 8, "faithfulness": 10}}}
+{"dataset_id": "dvzp-h4k9", "hs": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.19040902679830748, "rouge1": 0.29687500000000006, "rouge2": 0.03174603174603175, "rougeL": 0.10937499999999999, "bertscore_precision": 0.8184213638305664, "bertscore_recall": 0.847543478012085, "bertscore_f1": 0.83272784948349}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.427251079534267, "rouge1": 0.4216216216216216, "rouge2": 0.19672131147540986, "rougeL": 0.23783783783783785, "bertscore_precision": 0.8529409766197205, "bertscore_recall": 0.9013262391090393, "bertscore_f1": 0.8764663338661194}}, "sfd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.3038815748301224, "rouge1": 0.2457627118644068, "rouge2": 0.08547008547008547, "rougeL": 0.16101694915254233, "bertscore_precision": 0.7998921871185303, "bertscore_recall": 0.859335720539093, "bertscore_f1": 0.8285491466522217}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.427251079534267, "rouge1": 0.4216216216216216, "rouge2": 0.19672131147540986, "rougeL": 0.23783783783783785, "bertscore_precision": 0.8529409766197205, "bertscore_recall": 0.9013262391090393, "bertscore_f1": 0.8764663338661194}}, "sfd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.3038815748301224, "rouge1": 0.2457627118644068, "rouge2": 0.08547008547008547, "rougeL": 0.16101694915254233, "bertscore_precision": 0.7998921871185303, "bertscore_recall": 0.859335720539093, "bertscore_f1": 0.8285491466522217}}, "original": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "g6pj-fsah", "hs": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.15125085513726813, "rouge1": 0.22105263157894736, "rouge2": 0.05319148936170212, "rougeL": 0.13684210526315788, "bertscore_precision": 0.8505207300186157, "bertscore_recall": 0.83519047498703, "bertscore_f1": 0.8427859544754028}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.3248015552564678, "rouge1": 0.42145593869731807, "rouge2": 0.1776061776061776, "rougeL": 0.2681992337164751, "bertscore_precision": 0.8361489772796631, "bertscore_recall": 0.859716534614563, "bertscore_f1": 0.8477689623832703}}, "sfd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.23998642487422192, "rouge1": 0.33015873015873015, "rouge2": 0.09584664536741214, "rougeL": 0.17142857142857143, "bertscore_precision": 0.8042256236076355, "bertscore_recall": 0.8356220722198486, "bertscore_f1": 0.8196232318878174}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.3248015552564678, "rouge1": 0.42145593869731807, "rouge2": 0.1776061776061776, "rougeL": 0.2681992337164751, "bertscore_precision": 0.8361489772796631, "bertscore_recall": 0.859716534614563, "bertscore_f1": 0.8477689623832703}}, "sfd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.23998642487422192, "rouge1": 0.33015873015873015, "rouge2": 0.09584664536741214, "rougeL": 0.17142857142857143, "bertscore_precision": 0.8042256236076355, "bertscore_recall": 0.8356220722198486, "bertscore_f1": 0.8196232318878174}}, "original": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "fudw-fgrp", "hs": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.05686433793663687, "rouge1": 0.1453287197231834, "rouge2": 0.027874564459930317, "rougeL": 0.10380622837370242, "bertscore_precision": 0.8073561191558838, "bertscore_recall": 0.7762245535850525, "bertscore_f1": 0.7914843559265137}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.12587900862186274, "rouge1": 0.3028571428571429, "rouge2": 0.06321839080459771, "rougeL": 0.15428571428571428, "bertscore_precision": 0.8346517086029053, "bertscore_recall": 0.800035297870636, "bertscore_f1": 0.8169770240783691}}, "sfd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.12634604004791927, "rouge1": 0.26598465473145777, "rouge2": 0.056555269922879174, "rougeL": 0.14322250639386191, "bertscore_precision": 0.8057324886322021, "bertscore_recall": 0.7989954352378845, "bertscore_f1": 0.8023498058319092}}, "ufd_nyc": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.12587900862186274, "rouge1": 0.3028571428571429, "rouge2": 0.06321839080459771, "rougeL": 0.15428571428571428, "bertscore_precision": 0.8346517086029053, "bertscore_recall": 0.800035297870636, "bertscore_f1": 0.8169770240783691}}, "sfd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.12634604004791927, "rouge1": 0.26598465473145777, "rouge2": 0.056555269922879174, "rougeL": 0.14322250639386191, "bertscore_precision": 0.8057324886322021, "bertscore_recall": 0.7989954352378845, "bertscore_f1": 0.8023498058319092}}, "original": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "53m8-jdtg", "hs": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.08954154727793694, "rouge1": 0.13065326633165827, "rouge2": 0.0, "rougeL": 0.09045226130653265, "bertscore_precision": 0.8223433494567871, "bertscore_recall": 0.8053699731826782, "bertscore_f1": 0.8137681484222412}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.24963345526664665, "rouge1": 0.3657587548638132, "rouge2": 0.0784313725490196, "rougeL": 0.20233463035019456, "bertscore_precision": 0.8309974074363708, "bertscore_recall": 0.837902307510376, "bertscore_f1": 0.8344355821609497}}, "sfd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.16160949868073882, "rouge1": 0.26523297491039427, "rouge2": 0.05054151624548736, "rougeL": 0.13620071684587812, "bertscore_precision": 0.7936466932296753, "bertscore_recall": 0.8178999423980713, "bertscore_f1": 0.8055908679962158}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.24963345526664665, "rouge1": 0.3657587548638132, "rouge2": 0.0784313725490196, "rougeL": 0.20233463035019456, "bertscore_precision": 0.8309974074363708, "bertscore_recall": 0.837902307510376, "bertscore_f1": 0.8344355821609497}}, "sfd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.16160949868073882, "rouge1": 0.26523297491039427, "rouge2": 0.05054151624548736, "rougeL": 0.13620071684587812, "bertscore_precision": 0.7936466932296753, "bertscore_recall": 0.8178999423980713, "bertscore_f1": 0.8055908679962158}}, "original": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "i38t-6if2", "hs": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.04537200691046846, "rouge1": 0.10893246187363835, "rouge2": 0.02188183807439825, "rougeL": 0.06971677559912855, "bertscore_precision": 0.8119893670082092, "bertscore_recall": 0.7185141444206238, "bertscore_f1": 0.7623972296714783}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.10487432509210814, "rouge1": 0.2709447415329769, "rouge2": 0.07513416815742396, "rougeL": 0.13547237076648844, "bertscore_precision": 0.8208414912223816, "bertscore_recall": 0.7483290433883667, "bertscore_f1": 0.7829098701477051}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.12238669302656525, "rouge1": 0.24079320113314445, "rouge2": 0.059659090909090905, "rougeL": 0.13881019830028327, "bertscore_precision": 0.776502251625061, "bertscore_recall": 0.7517205476760864, "bertscore_f1": 0.7639104723930359}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.10487432509210814, "rouge1": 0.2709447415329769, "rouge2": 0.07513416815742396, "rougeL": 0.13547237076648844, "bertscore_precision": 0.8208414912223816, "bertscore_recall": 0.7483290433883667, "bertscore_f1": 0.7829098701477051}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.12238669302656525, "rouge1": 0.24079320113314445, "rouge2": 0.059659090909090905, "rougeL": 0.13881019830028327, "bertscore_precision": 0.776502251625061, "bertscore_recall": 0.7517205476760864, "bertscore_f1": 0.7639104723930359}}, "original": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}}}
+{"dataset_id": "7ewi-9cdf", "hs": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.3586647727272727, "rouge1": 0.28571428571428575, "rouge2": 0.0851063829787234, "rougeL": 0.28571428571428575, "bertscore_precision": 0.870207667350769, "bertscore_recall": 0.9238646030426025, "bertscore_f1": 0.8962337374687195}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.4256126242318489, "rouge1": 0.19402985074626863, "rouge2": 0.1212121212121212, "rougeL": 0.16417910447761191, "bertscore_precision": 0.821718692779541, "bertscore_recall": 0.9310861825942993, "bertscore_f1": 0.8729904294013977}}, "sfd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.254306758674693, "rouge1": 0.11016949152542373, "rouge2": 0.05128205128205128, "rougeL": 0.09322033898305085, "bertscore_precision": 0.7621437907218933, "bertscore_recall": 0.8973655700683594, "bertscore_f1": 0.8242455124855042}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.4256126242318489, "rouge1": 0.19402985074626863, "rouge2": 0.1212121212121212, "rougeL": 0.16417910447761191, "bertscore_precision": 0.821718692779541, "bertscore_recall": 0.9310861825942993, "bertscore_f1": 0.8729904294013977}}, "sfd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.254306758674693, "rouge1": 0.11016949152542373, "rouge2": 0.05128205128205128, "rougeL": 0.09322033898305085, "bertscore_precision": 0.7621437907218933, "bertscore_recall": 0.8973655700683594, "bertscore_f1": 0.8242455124855042}}, "original": {"ref_free": {"completeness": 3, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "gi8d-wdg5", "hs": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.20454137070860812, "rouge1": 0.2545454545454546, "rouge2": 0.07407407407407407, "rougeL": 0.18181818181818182, "bertscore_precision": 0.874220609664917, "bertscore_recall": 0.8660399913787842, "bertscore_f1": 0.8701110482215881}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.26053862837552116, "rouge1": 0.29591836734693877, "rouge2": 0.08247422680412371, "rougeL": 0.16326530612244897, "bertscore_precision": 0.8173127770423889, "bertscore_recall": 0.8720380067825317, "bertscore_f1": 0.8437889218330383}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2634334576875248, "rouge1": 0.19767441860465115, "rouge2": 0.029239766081871347, "rougeL": 0.11046511627906977, "bertscore_precision": 0.7751443386077881, "bertscore_recall": 0.863051176071167, "bertscore_f1": 0.8167392015457153}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.26053862837552116, "rouge1": 0.29591836734693877, "rouge2": 0.08247422680412371, "rougeL": 0.16326530612244897, "bertscore_precision": 0.8173127770423889, "bertscore_recall": 0.8720380067825317, "bertscore_f1": 0.8437889218330383}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2634334576875248, "rouge1": 0.19767441860465115, "rouge2": 0.029239766081871347, "rougeL": 0.11046511627906977, "bertscore_precision": 0.7751443386077881, "bertscore_recall": 0.863051176071167, "bertscore_f1": 0.8167392015457153}}, "original": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "ga3c-v25a", "hs": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.14586361434108527, "rouge1": 0.2285714285714286, "rouge2": 0.01941747572815534, "rougeL": 0.1523809523809524, "bertscore_precision": 0.7887634038925171, "bertscore_recall": 0.8137273788452148, "bertscore_f1": 0.8010509610176086}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.3361667852122813, "rouge1": 0.3404255319148936, "rouge2": 0.13978494623655913, "rougeL": 0.19148936170212763, "bertscore_precision": 0.8220579028129578, "bertscore_recall": 0.8425558805465698, "bertscore_f1": 0.8321806788444519}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.27889870296623687, "rouge1": 0.2185430463576159, "rouge2": 0.07333333333333333, "rougeL": 0.12582781456953643, "bertscore_precision": 0.7703672647476196, "bertscore_recall": 0.8275212645530701, "bertscore_f1": 0.7979221343994141}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.3361667852122813, "rouge1": 0.3404255319148936, "rouge2": 0.13978494623655913, "rougeL": 0.19148936170212763, "bertscore_precision": 0.8220579028129578, "bertscore_recall": 0.8425558805465698, "bertscore_f1": 0.8321806788444519}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.27889870296623687, "rouge1": 0.2185430463576159, "rouge2": 0.07333333333333333, "rougeL": 0.12582781456953643, "bertscore_precision": 0.7703672647476196, "bertscore_recall": 0.8275212645530701, "bertscore_f1": 0.7979221343994141}}, "original": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "423i-ukqr", "hs": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.07178320577176339, "rouge1": 0.2583732057416268, "rouge2": 0.09661835748792269, "rougeL": 0.16267942583732056, "bertscore_precision": 0.8448914885520935, "bertscore_recall": 0.8189296126365662, "bertscore_f1": 0.8317079544067383}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.3141233384845981, "rouge1": 0.45508982035928147, "rouge2": 0.15662650602409636, "rougeL": 0.20958083832335334, "bertscore_precision": 0.8627647161483765, "bertscore_recall": 0.8540621399879456, "bertscore_f1": 0.8583913445472717}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.20754323953105375, "rouge1": 0.2807881773399014, "rouge2": 0.09900990099009901, "rougeL": 0.1477832512315271, "bertscore_precision": 0.7821903824806213, "bertscore_recall": 0.8215153813362122, "bertscore_f1": 0.8013706803321838}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.3141233384845981, "rouge1": 0.45508982035928147, "rouge2": 0.15662650602409636, "rougeL": 0.20958083832335334, "bertscore_precision": 0.8627647161483765, "bertscore_recall": 0.8540621399879456, "bertscore_f1": 0.8583913445472717}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.20754323953105375, "rouge1": 0.2807881773399014, "rouge2": 0.09900990099009901, "rougeL": 0.1477832512315271, "bertscore_precision": 0.7821903824806213, "bertscore_recall": 0.8215153813362122, "bertscore_f1": 0.8013706803321838}}, "original": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}}}
+{"dataset_id": "b3mq-yvvr", "hs": {"ref_free": {"completeness": 7, "conciseness": 9, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.10259776179379315, "rouge1": 0.20161290322580644, "rouge2": 0.05691056910569105, "rougeL": 0.14516129032258066, "bertscore_precision": 0.8876189589500427, "bertscore_recall": 0.8232315182685852, "bertscore_f1": 0.8542136549949646}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.23801523297491037, "rouge1": 0.4444444444444444, "rouge2": 0.13966480446927373, "rougeL": 0.2555555555555556, "bertscore_precision": 0.8482186198234558, "bertscore_recall": 0.8487814664840698, "bertscore_f1": 0.8484999537467957}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2826486491804765, "rouge1": 0.411764705882353, "rouge2": 0.1299212598425197, "rougeL": 0.22352941176470587, "bertscore_precision": 0.7998173832893372, "bertscore_recall": 0.8410416841506958, "bertscore_f1": 0.8199116587638855}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.23801523297491037, "rouge1": 0.4444444444444444, "rouge2": 0.13966480446927373, "rougeL": 0.2555555555555556, "bertscore_precision": 0.8482186198234558, "bertscore_recall": 0.8487814664840698, "bertscore_f1": 0.8484999537467957}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2826486491804765, "rouge1": 0.411764705882353, "rouge2": 0.1299212598425197, "rougeL": 0.22352941176470587, "bertscore_precision": 0.7998173832893372, "bertscore_recall": 0.8410416841506958, "bertscore_f1": 0.8199116587638855}}, "original": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "br6q-ssj3", "hs": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.10405703079071628, "rouge1": 0.20863309352517986, "rouge2": 0.028985507246376812, "rougeL": 0.11510791366906477, "bertscore_precision": 0.8641417026519775, "bertscore_recall": 0.7613889575004578, "bertscore_f1": 0.8095177412033081}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2653410536062972, "rouge1": 0.4160401002506266, "rouge2": 0.12090680100755667, "rougeL": 0.19047619047619047, "bertscore_precision": 0.8452553749084473, "bertscore_recall": 0.7936325073242188, "bertscore_f1": 0.8186309337615967}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.2225567488140866, "rouge1": 0.3575883575883576, "rouge2": 0.10020876826722337, "rougeL": 0.17463617463617465, "bertscore_precision": 0.7898272275924683, "bertscore_recall": 0.7823061943054199, "bertscore_f1": 0.7860487103462219}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2653410536062972, "rouge1": 0.4160401002506266, "rouge2": 0.12090680100755667, "rougeL": 0.19047619047619047, "bertscore_precision": 0.8452553749084473, "bertscore_recall": 0.7936325073242188, "bertscore_f1": 0.8186309337615967}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.2225567488140866, "rouge1": 0.3575883575883576, "rouge2": 0.10020876826722337, "rougeL": 0.17463617463617465, "bertscore_precision": 0.7898272275924683, "bertscore_recall": 0.7823061943054199, "bertscore_f1": 0.7860487103462219}}, "original": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "2t89-756w", "hs": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2921323690554459, "rouge1": 0.3793103448275862, "rouge2": 0.07142857142857144, "rougeL": 0.20689655172413793, "bertscore_precision": 0.8464860916137695, "bertscore_recall": 0.8945216536521912, "bertscore_f1": 0.8698411583900452}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.4022536687631028, "rouge1": 0.2328042328042328, "rouge2": 0.1283422459893048, "rougeL": 0.14814814814814817, "bertscore_precision": 0.8080947995185852, "bertscore_recall": 0.9405771493911743, "bertscore_f1": 0.8693174123764038}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.24094113406053494, "rouge1": 0.1276595744680851, "rouge2": 0.07339449541284404, "rougeL": 0.0972644376899696, "bertscore_precision": 0.7753864526748657, "bertscore_recall": 0.9157727956771851, "bertscore_f1": 0.839752733707428}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.4022536687631028, "rouge1": 0.2328042328042328, "rouge2": 0.1283422459893048, "rougeL": 0.14814814814814817, "bertscore_precision": 0.8080947995185852, "bertscore_recall": 0.9405771493911743, "bertscore_f1": 0.8693174123764038}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.24094113406053494, "rouge1": 0.1276595744680851, "rouge2": 0.07339449541284404, "rougeL": 0.0972644376899696, "bertscore_precision": 0.7753864526748657, "bertscore_recall": 0.9157727956771851, "bertscore_f1": 0.839752733707428}}, "original": {"ref_free": {"completeness": 6, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "irs3-wn2g", "hs": {"ref_free": {"completeness": 7, "conciseness": 9, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.211864406779661, "rouge1": 0.29629629629629634, "rouge2": 0.0, "rougeL": 0.29629629629629634, "bertscore_precision": 0.792715311050415, "bertscore_recall": 0.8745574355125427, "bertscore_f1": 0.8316276669502258}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2199962553828871, "rouge1": 0.1217391304347826, "rouge2": 0.03539823008849558, "rougeL": 0.1217391304347826, "bertscore_precision": 0.80500727891922, "bertscore_recall": 0.9025722146034241, "bertscore_f1": 0.8510025143623352}}, "sfd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.14696995856353592, "rouge1": 0.07692307692307693, "rouge2": 0.019417475728155338, "rougeL": 0.0673076923076923, "bertscore_precision": 0.7383409738540649, "bertscore_recall": 0.8595760464668274, "bertscore_f1": 0.7943594455718994}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2199962553828871, "rouge1": 0.1217391304347826, "rouge2": 0.03539823008849558, "rougeL": 0.1217391304347826, "bertscore_precision": 0.80500727891922, "bertscore_recall": 0.9025722146034241, "bertscore_f1": 0.8510025143623352}}, "sfd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.14696995856353592, "rouge1": 0.07692307692307693, "rouge2": 0.019417475728155338, "rougeL": 0.0673076923076923, "bertscore_precision": 0.7383409738540649, "bertscore_recall": 0.8595760464668274, "bertscore_f1": 0.7943594455718994}}, "original": {"ref_free": {"completeness": 3, "conciseness": 8, "readability": 7, "faithfulness": 10}}}
+{"dataset_id": "w9zq-xm8b", "hs": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.3230218855218856, "rouge1": 0.19230769230769232, "rouge2": 0.04, "rougeL": 0.15384615384615385, "bertscore_precision": 0.8277504444122314, "bertscore_recall": 0.9422521591186523, "bertscore_f1": 0.881297767162323}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.19655403144864506, "rouge1": 0.08275862068965517, "rouge2": 0.027972027972027972, "rougeL": 0.08275862068965517, "bertscore_precision": 0.8024972677230835, "bertscore_recall": 0.9183709621429443, "bertscore_f1": 0.8565329909324646}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.11025099695050436, "rouge1": 0.04270462633451958, "rouge2": 0.014336917562724016, "rougeL": 0.04270462633451958, "bertscore_precision": 0.7321509122848511, "bertscore_recall": 0.8893420100212097, "bertscore_f1": 0.8031272888183594}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.19655403144864506, "rouge1": 0.08275862068965517, "rouge2": 0.027972027972027972, "rougeL": 0.08275862068965517, "bertscore_precision": 0.8024972677230835, "bertscore_recall": 0.9183709621429443, "bertscore_f1": 0.8565329909324646}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.11025099695050436, "rouge1": 0.04270462633451958, "rouge2": 0.014336917562724016, "rougeL": 0.04270462633451958, "bertscore_precision": 0.7321509122848511, "bertscore_recall": 0.8893420100212097, "bertscore_f1": 0.8031272888183594}}, "original": {"ref_free": {"completeness": 2, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "tap2-dwrw", "hs": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.0838235294117647, "rouge1": 0.20603015075376882, "rouge2": 0.03535353535353535, "rougeL": 0.10552763819095477, "bertscore_precision": 0.8501307964324951, "bertscore_recall": 0.7820996046066284, "bertscore_f1": 0.8146974444389343}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.20798979290168257, "rouge1": 0.3790322580645161, "rouge2": 0.1376518218623482, "rougeL": 0.14919354838709675, "bertscore_precision": 0.8533284664154053, "bertscore_recall": 0.8149045705795288, "bertscore_f1": 0.8336740136146545}}, "sfd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.18448114726971868, "rouge1": 0.3221238938053097, "rouge2": 0.056838365896980464, "rougeL": 0.1486725663716814, "bertscore_precision": 0.8139339685440063, "bertscore_recall": 0.8165165185928345, "bertscore_f1": 0.815223217010498}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.20798979290168257, "rouge1": 0.3790322580645161, "rouge2": 0.1376518218623482, "rougeL": 0.14919354838709675, "bertscore_precision": 0.8533284664154053, "bertscore_recall": 0.8149045705795288, "bertscore_f1": 0.8336740136146545}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.18448114726971868, "rouge1": 0.3221238938053097, "rouge2": 0.056838365896980464, "rougeL": 0.1486725663716814, "bertscore_precision": 0.8139339685440063, "bertscore_recall": 0.8165165185928345, "bertscore_f1": 0.815223217010498}}, "original": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "8zyi-kxay", "hs": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.07530264513700784, "rouge1": 0.13502109704641352, "rouge2": 0.00851063829787234, "rougeL": 0.08438818565400844, "bertscore_precision": 0.7878746390342712, "bertscore_recall": 0.7835342288017273, "bertscore_f1": 0.785698413848877}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.19926194792292792, "rouge1": 0.3696969696969697, "rouge2": 0.09146341463414634, "rougeL": 0.18787878787878787, "bertscore_precision": 0.8490651249885559, "bertscore_recall": 0.8270297050476074, "bertscore_f1": 0.8379026055335999}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.2528995167641392, "rouge1": 0.40421052631578946, "rouge2": 0.08879492600422832, "rougeL": 0.17684210526315788, "bertscore_precision": 0.7875087857246399, "bertscore_recall": 0.8214053511619568, "bertscore_f1": 0.8041000366210938}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.19926194792292792, "rouge1": 0.3696969696969697, "rouge2": 0.09146341463414634, "rougeL": 0.18787878787878787, "bertscore_precision": 0.8490651249885559, "bertscore_recall": 0.8270297050476074, "bertscore_f1": 0.8379026055335999}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.2528995167641392, "rouge1": 0.40421052631578946, "rouge2": 0.08879492600422832, "rougeL": 0.17684210526315788, "bertscore_precision": 0.7875087857246399, "bertscore_recall": 0.8214053511619568, "bertscore_f1": 0.8041000366210938}}, "original": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "nmue-7zq2", "hs": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.05244755244755244, "rouge1": 0.08450704225352111, "rouge2": 0.0, "rougeL": 0.056338028169014086, "bertscore_precision": 0.7417135834693909, "bertscore_recall": 0.8461717367172241, "bertscore_f1": 0.7905067801475525}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 9, "faithfulness": 7}, "similarity": {"meteor": 0.228136091393079, "rouge1": 0.16774193548387095, "rouge2": 0.10457516339869281, "rougeL": 0.12903225806451613, "bertscore_precision": 0.7985334396362305, "bertscore_recall": 0.9021110534667969, "bertscore_f1": 0.8471680283546448}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 1}, "similarity": {"meteor": 0.11224489795918369, "rouge1": 0.08461538461538462, "rouge2": 0.046511627906976744, "rougeL": 0.06923076923076922, "bertscore_precision": 0.7416297197341919, "bertscore_recall": 0.8811116814613342, "bertscore_f1": 0.8053761124610901}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 9, "faithfulness": 7}, "similarity": {"meteor": 0.228136091393079, "rouge1": 0.16774193548387095, "rouge2": 0.10457516339869281, "rougeL": 0.12903225806451613, "bertscore_precision": 0.7985334396362305, "bertscore_recall": 0.9021110534667969, "bertscore_f1": 0.8471680283546448}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 1}, "similarity": {"meteor": 0.11224489795918369, "rouge1": 0.08461538461538462, "rouge2": 0.046511627906976744, "rougeL": 0.06923076923076922, "bertscore_precision": 0.7416297197341919, "bertscore_recall": 0.8811116814613342, "bertscore_f1": 0.8053761124610901}}, "original": {"ref_free": {"completeness": 7, "conciseness": 9, "readability": 10, "faithfulness": 10}}}
+{"dataset_id": "wcg2-rbkn", "hs": {"ref_free": {"completeness": 8, "conciseness": 9, "readability": 10, "faithfulness": 10}, "similarity": {"meteor": 0.10695187165775402, "rouge1": 0.1, "rouge2": 0.0, "rougeL": 0.06666666666666667, "bertscore_precision": 0.772261381149292, "bertscore_recall": 0.8299006819725037, "bertscore_f1": 0.8000441789627075}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.2712673611111112, "rouge1": 0.1726618705035971, "rouge2": 0.11678832116788321, "rougeL": 0.14388489208633093, "bertscore_precision": 0.8056171536445618, "bertscore_recall": 0.9044301509857178, "bertscore_f1": 0.8521687984466553}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.1096892138939671, "rouge1": 0.07100591715976332, "rouge2": 0.047619047619047616, "rougeL": 0.05917159763313609, "bertscore_precision": 0.7479535937309265, "bertscore_recall": 0.871628999710083, "bertscore_f1": 0.8050691485404968}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.2712673611111112, "rouge1": 0.1726618705035971, "rouge2": 0.11678832116788321, "rougeL": 0.14388489208633093, "bertscore_precision": 0.8056171536445618, "bertscore_recall": 0.9044301509857178, "bertscore_f1": 0.8521687984466553}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.1096892138939671, "rouge1": 0.07100591715976332, "rouge2": 0.047619047619047616, "rougeL": 0.05917159763313609, "bertscore_precision": 0.7479535937309265, "bertscore_recall": 0.871628999710083, "bertscore_f1": 0.8050691485404968}}, "original": {"ref_free": {"completeness": 6, "conciseness": 9, "readability": 8, "faithfulness": 10}}}
+{"dataset_id": "bd8j-m46a", "hs": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.12919261444335192, "rouge1": 0.19753086419753088, "rouge2": 0.05063291139240506, "rougeL": 0.12345679012345678, "bertscore_precision": 0.8384360074996948, "bertscore_recall": 0.8388670086860657, "bertscore_f1": 0.8386514186859131}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.32838405322862135, "rouge1": 0.3240223463687151, "rouge2": 0.192090395480226, "rougeL": 0.24581005586592175, "bertscore_precision": 0.8176862597465515, "bertscore_recall": 0.8920906782150269, "bertscore_f1": 0.8532695770263672}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.23661396782256305, "rouge1": 0.15072463768115943, "rouge2": 0.08746355685131196, "rougeL": 0.12173913043478261, "bertscore_precision": 0.7580847144126892, "bertscore_recall": 0.8557260036468506, "bertscore_f1": 0.8039515018463135}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.32838405322862135, "rouge1": 0.3240223463687151, "rouge2": 0.192090395480226, "rougeL": 0.24581005586592175, "bertscore_precision": 0.8176862597465515, "bertscore_recall": 0.8920906782150269, "bertscore_f1": 0.8532695770263672}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.23661396782256305, "rouge1": 0.15072463768115943, "rouge2": 0.08746355685131196, "rougeL": 0.12173913043478261, "bertscore_precision": 0.7580847144126892, "bertscore_recall": 0.8557260036468506, "bertscore_f1": 0.8039515018463135}}, "original": {"ref_free": {"completeness": 6, "conciseness": 7, "readability": 8, "faithfulness": 10}}}
+{"dataset_id": "buv4-at34", "hs": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.20487205102589715, "rouge1": 0.3013698630136986, "rouge2": 0.08450704225352113, "rougeL": 0.21917808219178084, "bertscore_precision": 0.8418806791305542, "bertscore_recall": 0.844386875629425, "bertscore_f1": 0.8431318998336792}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.4227923645388057, "rouge1": 0.33333333333333337, "rouge2": 0.175, "rougeL": 0.19753086419753088, "bertscore_precision": 0.8290026187896729, "bertscore_recall": 0.9018439650535583, "bertscore_f1": 0.863890528678894}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.25838522888670384, "rouge1": 0.15384615384615383, "rouge2": 0.08080808080808081, "rougeL": 0.11371237458193978, "bertscore_precision": 0.7756959199905396, "bertscore_recall": 0.8654019236564636, "bertscore_f1": 0.8180971741676331}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.4227923645388057, "rouge1": 0.33333333333333337, "rouge2": 0.175, "rougeL": 0.19753086419753088, "bertscore_precision": 0.8290026187896729, "bertscore_recall": 0.9018439650535583, "bertscore_f1": 0.863890528678894}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.25838522888670384, "rouge1": 0.15384615384615383, "rouge2": 0.08080808080808081, "rougeL": 0.11371237458193978, "bertscore_precision": 0.7756959199905396, "bertscore_recall": 0.8654019236564636, "bertscore_f1": 0.8180971741676331}}, "original": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "9f5n-qdib", "hs": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.35866477272727276, "rouge1": 0.208955223880597, "rouge2": 0.09230769230769231, "rougeL": 0.208955223880597, "bertscore_precision": 0.8056274652481079, "bertscore_recall": 0.9089241027832031, "bertscore_f1": 0.8541641235351562}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.21183333333333335, "rouge1": 0.125, "rouge2": 0.07594936708860758, "rougeL": 0.1125, "bertscore_precision": 0.7972991466522217, "bertscore_recall": 0.9298145771026611, "bertscore_f1": 0.8584731221199036}}, "sfd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.16915686194683063, "rouge1": 0.08695652173913045, "rouge2": 0.05263157894736842, "rougeL": 0.0782608695652174, "bertscore_precision": 0.7414252758026123, "bertscore_recall": 0.8986940383911133, "bertscore_f1": 0.8125195503234863}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.21183333333333335, "rouge1": 0.125, "rouge2": 0.07594936708860758, "rougeL": 0.1125, "bertscore_precision": 0.7972991466522217, "bertscore_recall": 0.9298145771026611, "bertscore_f1": 0.8584731221199036}}, "sfd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.16915686194683063, "rouge1": 0.08695652173913045, "rouge2": 0.05263157894736842, "rougeL": 0.0782608695652174, "bertscore_precision": 0.7414252758026123, "bertscore_recall": 0.8986940383911133, "bertscore_f1": 0.8125195503234863}}, "original": {"ref_free": {"completeness": 6, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "8rjn-kpsh", "hs": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.05813953488372094, "rouge1": 0.03636363636363636, "rouge2": 0.0, "rougeL": 0.03636363636363636, "bertscore_precision": 0.7787235379219055, "bertscore_recall": 0.8219507336616516, "bertscore_f1": 0.7997534871101379}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.0997340425531915, "rouge1": 0.03007518796992481, "rouge2": 0.015267175572519085, "rougeL": 0.03007518796992481, "bertscore_precision": 0.7632896900177002, "bertscore_recall": 0.8470884561538696, "bertscore_f1": 0.8030087947845459}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.029411764705882356, "rouge1": 0.0163265306122449, "rouge2": 0.008230452674897118, "rougeL": 0.0163265306122449, "bertscore_precision": 0.7119540572166443, "bertscore_recall": 0.836754322052002, "bertscore_f1": 0.7693257927894592}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.0997340425531915, "rouge1": 0.03007518796992481, "rouge2": 0.015267175572519085, "rougeL": 0.03007518796992481, "bertscore_precision": 0.7632896900177002, "bertscore_recall": 0.8470884561538696, "bertscore_f1": 0.8030087947845459}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.029411764705882356, "rouge1": 0.0163265306122449, "rouge2": 0.008230452674897118, "rougeL": 0.0163265306122449, "bertscore_precision": 0.7119540572166443, "bertscore_recall": 0.836754322052002, "bertscore_f1": 0.7693257927894592}}, "original": {"ref_free": {"completeness": 2, "conciseness": 1, "readability": 1, "faithfulness": 10}}}
+{"dataset_id": "9rxf-re6u", "hs": {"ref_free": {"completeness": 2, "conciseness": 1, "readability": 1, "faithfulness": 10}, "similarity": {"meteor": 0.0, "rouge1": 0.2988505747126437, "rouge2": 0.16470588235294117, "rougeL": 0.2528735632183908, "bertscore_precision": 0.7818903923034668, "bertscore_recall": 0.8459864258766174, "bertscore_f1": 0.8126766085624695}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.3505162705688868, "rouge1": 0.40609137055837563, "rouge2": 0.18461538461538463, "rougeL": 0.2639593908629442, "bertscore_precision": 0.8271342515945435, "bertscore_recall": 0.8931940197944641, "bertscore_f1": 0.8588957786560059}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.27219524211711715, "rouge1": 0.21243523316062177, "rouge2": 0.10937499999999999, "rougeL": 0.13989637305699482, "bertscore_precision": 0.7584131360054016, "bertscore_recall": 0.8747321367263794, "bertscore_f1": 0.8124302625656128}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.3505162705688868, "rouge1": 0.40609137055837563, "rouge2": 0.18461538461538463, "rougeL": 0.2639593908629442, "bertscore_precision": 0.8271342515945435, "bertscore_recall": 0.8931940197944641, "bertscore_f1": 0.8588957786560059}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.27219524211711715, "rouge1": 0.21243523316062177, "rouge2": 0.10937499999999999, "rougeL": 0.13989637305699482, "bertscore_precision": 0.7584131360054016, "bertscore_recall": 0.8747321367263794, "bertscore_f1": 0.8124302625656128}}, "original": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "h8ar-pcmr", "hs": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.1892744479495268, "rouge1": 0.2051282051282051, "rouge2": 0.05263157894736842, "rougeL": 0.15384615384615385, "bertscore_precision": 0.8426139950752258, "bertscore_recall": 0.8897839784622192, "bertscore_f1": 0.8655567765235901}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.24296675191815859, "rouge1": 0.218978102189781, "rouge2": 0.07407407407407407, "rougeL": 0.1605839416058394, "bertscore_precision": 0.8466836214065552, "bertscore_recall": 0.8979041576385498, "bertscore_f1": 0.8715419769287109}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.18691588785046734, "rouge1": 0.13278008298755187, "rouge2": 0.04184100418410042, "rougeL": 0.0995850622406639, "bertscore_precision": 0.7793790102005005, "bertscore_recall": 0.8661017417907715, "bertscore_f1": 0.8204550743103027}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.24296675191815859, "rouge1": 0.218978102189781, "rouge2": 0.07407407407407407, "rougeL": 0.1605839416058394, "bertscore_precision": 0.8466836214065552, "bertscore_recall": 0.8979041576385498, "bertscore_f1": 0.8715419769287109}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.18691588785046734, "rouge1": 0.13278008298755187, "rouge2": 0.04184100418410042, "rougeL": 0.0995850622406639, "bertscore_precision": 0.7793790102005005, "bertscore_recall": 0.8661017417907715, "bertscore_f1": 0.8204550743103027}}, "original": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "k7nh-aufb", "hs": {"ref_free": {"completeness": 8, "conciseness": 6, "readability": 7, "faithfulness": 10}, "similarity": {"meteor": 0.0, "rouge1": 0.09195402298850575, "rouge2": 0.0, "rougeL": 0.04597701149425287, "bertscore_precision": 0.7480440139770508, "bertscore_recall": 0.8333150744438171, "bertscore_f1": 0.78838050365448}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.3857306997866171, "rouge1": 0.26436781609195403, "rouge2": 0.12790697674418605, "rougeL": 0.19540229885057472, "bertscore_precision": 0.8107628226280212, "bertscore_recall": 0.9271585941314697, "bertscore_f1": 0.8650628924369812}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.1683071062446399, "rouge1": 0.10434782608695653, "rouge2": 0.03498542274052478, "rougeL": 0.07536231884057971, "bertscore_precision": 0.7645625472068787, "bertscore_recall": 0.8476411700248718, "bertscore_f1": 0.8039612770080566}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.3857306997866171, "rouge1": 0.26436781609195403, "rouge2": 0.12790697674418605, "rougeL": 0.19540229885057472, "bertscore_precision": 0.8107628226280212, "bertscore_recall": 0.9271585941314697, "bertscore_f1": 0.8650628924369812}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.1683071062446399, "rouge1": 0.10434782608695653, "rouge2": 0.03498542274052478, "rougeL": 0.07536231884057971, "bertscore_precision": 0.7645625472068787, "bertscore_recall": 0.8476411700248718, "bertscore_f1": 0.8039612770080566}}, "original": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "tg3t-nh4h", "hs": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2664930555555555, "rouge1": 0.2278481012658228, "rouge2": 0.051948051948051945, "rougeL": 0.12658227848101267, "bertscore_precision": 0.8357330560684204, "bertscore_recall": 0.8639476299285889, "bertscore_f1": 0.8496061563491821}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.36516546131930744, "rouge1": 0.26993865030674846, "rouge2": 0.12422360248447203, "rougeL": 0.17177914110429446, "bertscore_precision": 0.8171160221099854, "bertscore_recall": 0.9340270757675171, "bertscore_f1": 0.8716689348220825}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.26452467650692507, "rouge1": 0.16129032258064516, "rouge2": 0.06504065040650406, "rougeL": 0.11290322580645161, "bertscore_precision": 0.7654784321784973, "bertscore_recall": 0.9102427363395691, "bertscore_f1": 0.8316075801849365}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.36516546131930744, "rouge1": 0.26993865030674846, "rouge2": 0.12422360248447203, "rougeL": 0.17177914110429446, "bertscore_precision": 0.8171160221099854, "bertscore_recall": 0.9340270757675171, "bertscore_f1": 0.8716689348220825}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.26452467650692507, "rouge1": 0.16129032258064516, "rouge2": 0.06504065040650406, "rougeL": 0.11290322580645161, "bertscore_precision": 0.7654784321784973, "bertscore_recall": 0.9102427363395691, "bertscore_f1": 0.8316075801849365}}, "original": {"ref_free": {"completeness": 6, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "an6v-iuem", "hs": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.05434782608695653, "rouge1": 0.05555555555555555, "rouge2": 0.0, "rougeL": 0.05555555555555555, "bertscore_precision": 0.774043619632721, "bertscore_recall": 0.8358755707740784, "bertscore_f1": 0.8037721514701843}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.10917030567685591, "rouge1": 0.062111801242236024, "rouge2": 0.025157232704402514, "rougeL": 0.049689440993788817, "bertscore_precision": 0.7773000001907349, "bertscore_recall": 0.8689941167831421, "bertscore_f1": 0.8205934762954712}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.09612068965517244, "rouge1": 0.03095975232198142, "rouge2": 0.012461059190031154, "rougeL": 0.02476780185758514, "bertscore_precision": 0.7178617119789124, "bertscore_recall": 0.8469467163085938, "bertscore_f1": 0.7770799994468689}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.10917030567685591, "rouge1": 0.062111801242236024, "rouge2": 0.025157232704402514, "rougeL": 0.049689440993788817, "bertscore_precision": 0.7773000001907349, "bertscore_recall": 0.8689941167831421, "bertscore_f1": 0.8205934762954712}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.09612068965517244, "rouge1": 0.03095975232198142, "rouge2": 0.012461059190031154, "rougeL": 0.02476780185758514, "bertscore_precision": 0.7178617119789124, "bertscore_recall": 0.8469467163085938, "bertscore_f1": 0.7770799994468689}}, "original": {"ref_free": {"completeness": 2, "conciseness": 1, "readability": 3, "faithfulness": 10}}}
+{"dataset_id": "jkdk-6p97", "hs": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.16304347826086957, "rouge1": 0.13793103448275862, "rouge2": 0.0, "rougeL": 0.13793103448275862, "bertscore_precision": 0.8277840614318848, "bertscore_recall": 0.8779566287994385, "bertscore_f1": 0.8521324396133423}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.17412935323383086, "rouge1": 0.09917355371900827, "rouge2": 0.06722689075630252, "rougeL": 0.09917355371900827, "bertscore_precision": 0.8052784204483032, "bertscore_recall": 0.9272958040237427, "bertscore_f1": 0.8619905114173889}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.08313539192399051, "rouge1": 0.045283018867924525, "rouge2": 0.03802281368821293, "rougeL": 0.045283018867924525, "bertscore_precision": 0.7386671900749207, "bertscore_recall": 0.8864927291870117, "bertscore_f1": 0.8058567643165588}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.17412935323383086, "rouge1": 0.09917355371900827, "rouge2": 0.06722689075630252, "rougeL": 0.09917355371900827, "bertscore_precision": 0.8052784204483032, "bertscore_recall": 0.9272958040237427, "bertscore_f1": 0.8619905114173889}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.08313539192399051, "rouge1": 0.045283018867924525, "rouge2": 0.03802281368821293, "rougeL": 0.045283018867924525, "bertscore_precision": 0.7386671900749207, "bertscore_recall": 0.8864927291870117, "bertscore_f1": 0.8058567643165588}}, "original": {"ref_free": {"completeness": 3, "conciseness": 9, "readability": 10, "faithfulness": 10}}}
+{"dataset_id": "bst7-5464", "hs": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.09646807440925087, "rouge1": 0.1794871794871795, "rouge2": 0.026315789473684213, "rougeL": 0.12820512820512822, "bertscore_precision": 0.7909483909606934, "bertscore_recall": 0.7843616008758545, "bertscore_f1": 0.787641167640686}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.1586848880966528, "rouge1": 0.2185792349726776, "rouge2": 0.04419889502762431, "rougeL": 0.12021857923497266, "bertscore_precision": 0.8034515976905823, "bertscore_recall": 0.7940261363983154, "bertscore_f1": 0.7987110614776611}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.18447024673439769, "rouge1": 0.17490494296577944, "rouge2": 0.030651340996168584, "rougeL": 0.10646387832699619, "bertscore_precision": 0.7557286620140076, "bertscore_recall": 0.7891799807548523, "bertscore_f1": 0.7720921635627747}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.1586848880966528, "rouge1": 0.2185792349726776, "rouge2": 0.04419889502762431, "rougeL": 0.12021857923497266, "bertscore_precision": 0.8034515976905823, "bertscore_recall": 0.7940261363983154, "bertscore_f1": 0.7987110614776611}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.18447024673439769, "rouge1": 0.17490494296577944, "rouge2": 0.030651340996168584, "rougeL": 0.10646387832699619, "bertscore_precision": 0.7557286620140076, "bertscore_recall": 0.7891799807548523, "bertscore_f1": 0.7720921635627747}}, "original": {"ref_free": {"completeness": 6, "conciseness": 7, "readability": 8, "faithfulness": 10}}}
+{"dataset_id": "ej3f-9dad", "hs": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.08664259927797834, "rouge1": 0.1875, "rouge2": 0.02531645569620253, "rougeL": 0.125, "bertscore_precision": 0.8588007688522339, "bertscore_recall": 0.7962349057197571, "bertscore_f1": 0.8263351917266846}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.3272298606530342, "rouge1": 0.4581818181818182, "rouge2": 0.16849816849816848, "rougeL": 0.22545454545454546, "bertscore_precision": 0.8485358357429504, "bertscore_recall": 0.8466596603393555, "bertscore_f1": 0.8475967049598694}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.2807799940145855, "rouge1": 0.33488372093023255, "rouge2": 0.12149532710280375, "rougeL": 0.1813953488372093, "bertscore_precision": 0.7991751432418823, "bertscore_recall": 0.8333228826522827, "bertscore_f1": 0.8158918619155884}}, "ufd_nyc": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.3272298606530342, "rouge1": 0.4581818181818182, "rouge2": 0.16849816849816848, "rougeL": 0.22545454545454546, "bertscore_precision": 0.8485358357429504, "bertscore_recall": 0.8466596603393555, "bertscore_f1": 0.8475967049598694}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.2807799940145855, "rouge1": 0.33488372093023255, "rouge2": 0.12149532710280375, "rougeL": 0.1813953488372093, "bertscore_precision": 0.7991751432418823, "bertscore_recall": 0.8333228826522827, "bertscore_f1": 0.8158918619155884}}, "original": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "tmha-56pf", "hs": {"ref_free": {"completeness": 7, "conciseness": 9, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.33066666666666666, "rouge1": 0.47368421052631576, "rouge2": 0.2222222222222222, "rougeL": 0.3684210526315789, "bertscore_precision": 0.9252012372016907, "bertscore_recall": 0.9103353023529053, "bertscore_f1": 0.9177080988883972}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.3756148410776261, "rouge1": 0.3206106870229008, "rouge2": 0.21705426356589147, "rougeL": 0.21374045801526717, "bertscore_precision": 0.857307493686676, "bertscore_recall": 0.9382200241088867, "bertscore_f1": 0.8959406614303589}}, "sfd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.22985944538380546, "rouge1": 0.14179104477611942, "rouge2": 0.06766917293233084, "rougeL": 0.11940298507462688, "bertscore_precision": 0.7648639678955078, "bertscore_recall": 0.9039439558982849, "bertscore_f1": 0.8286083936691284}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.3756148410776261, "rouge1": 0.3206106870229008, "rouge2": 0.21705426356589147, "rougeL": 0.21374045801526717, "bertscore_precision": 0.857307493686676, "bertscore_recall": 0.9382200241088867, "bertscore_f1": 0.8959406614303589}}, "sfd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.22985944538380546, "rouge1": 0.14179104477611942, "rouge2": 0.06766917293233084, "rougeL": 0.11940298507462688, "bertscore_precision": 0.7648639678955078, "bertscore_recall": 0.9039439558982849, "bertscore_f1": 0.8286083936691284}}, "original": {"ref_free": {"completeness": 7, "conciseness": 9, "readability": 8, "faithfulness": 10}}}
+{"dataset_id": "axvu-zc97", "hs": {"ref_free": {"completeness": 8, "conciseness": 9, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.10397830018083183, "rouge1": 0.24161073825503354, "rouge2": 0.0272108843537415, "rougeL": 0.1610738255033557, "bertscore_precision": 0.7842005491256714, "bertscore_recall": 0.8058826327323914, "bertscore_f1": 0.7948938012123108}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.41483928174511175, "rouge1": 0.43321299638989175, "rouge2": 0.2181818181818182, "rougeL": 0.30324909747292417, "bertscore_precision": 0.8380757570266724, "bertscore_recall": 0.8817751407623291, "bertscore_f1": 0.8593702912330627}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.27161259835259405, "rouge1": 0.27355623100303955, "rouge2": 0.10397553516819572, "rougeL": 0.19452887537993918, "bertscore_precision": 0.77791428565979, "bertscore_recall": 0.8335928916931152, "bertscore_f1": 0.8047917485237122}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.41483928174511175, "rouge1": 0.43321299638989175, "rouge2": 0.2181818181818182, "rougeL": 0.30324909747292417, "bertscore_precision": 0.8380757570266724, "bertscore_recall": 0.8817751407623291, "bertscore_f1": 0.8593702912330627}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.27161259835259405, "rouge1": 0.27355623100303955, "rouge2": 0.10397553516819572, "rougeL": 0.19452887537993918, "bertscore_precision": 0.77791428565979, "bertscore_recall": 0.8335928916931152, "bertscore_f1": 0.8047917485237122}}, "original": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "68m2-uzcb", "hs": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.07587139423076923, "rouge1": 0.13559322033898305, "rouge2": 0.03508771929824561, "rougeL": 0.13559322033898305, "bertscore_precision": 0.8445167541503906, "bertscore_recall": 0.7799593806266785, "bertscore_f1": 0.810955286026001}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2272117400419288, "rouge1": 0.22641509433962265, "rouge2": 0.06369426751592357, "rougeL": 0.13836477987421383, "bertscore_precision": 0.8145802021026611, "bertscore_recall": 0.7993322610855103, "bertscore_f1": 0.806884229183197}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.16934011896325885, "rouge1": 0.17241379310344826, "rouge2": 0.034782608695652174, "rougeL": 0.10344827586206895, "bertscore_precision": 0.7697417736053467, "bertscore_recall": 0.7907742261886597, "bertscore_f1": 0.7801162600517273}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2272117400419288, "rouge1": 0.22641509433962265, "rouge2": 0.06369426751592357, "rougeL": 0.13836477987421383, "bertscore_precision": 0.8145802021026611, "bertscore_recall": 0.7993322610855103, "bertscore_f1": 0.806884229183197}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.16934011896325885, "rouge1": 0.17241379310344826, "rouge2": 0.034782608695652174, "rougeL": 0.10344827586206895, "bertscore_precision": 0.7697417736053467, "bertscore_recall": 0.7907742261886597, "bertscore_f1": 0.7801162600517273}}, "original": {"ref_free": {"completeness": 6, "conciseness": 7, "readability": 8, "faithfulness": 10}}}
+{"dataset_id": "tzwr-vksx", "hs": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.5125, "rouge1": 0.4615384615384615, "rouge2": 0.1081081081081081, "rougeL": 0.30769230769230765, "bertscore_precision": 0.8490495681762695, "bertscore_recall": 0.9200773239135742, "bertscore_f1": 0.883137583732605}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.1660516605166052, "rouge1": 0.10062893081761007, "rouge2": 0.025477707006369428, "rougeL": 0.08805031446540881, "bertscore_precision": 0.7803552150726318, "bertscore_recall": 0.8839426040649414, "bertscore_f1": 0.8289252519607544}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.10975609756097564, "rouge1": 0.06374501992031872, "rouge2": 0.01606425702811245, "rougeL": 0.06374501992031872, "bertscore_precision": 0.7306388020515442, "bertscore_recall": 0.8648278117179871, "bertscore_f1": 0.7920902371406555}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.1660516605166052, "rouge1": 0.10062893081761007, "rouge2": 0.025477707006369428, "rougeL": 0.08805031446540881, "bertscore_precision": 0.7803552150726318, "bertscore_recall": 0.8839426040649414, "bertscore_f1": 0.8289252519607544}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.10975609756097564, "rouge1": 0.06374501992031872, "rouge2": 0.01606425702811245, "rougeL": 0.06374501992031872, "bertscore_precision": 0.7306388020515442, "bertscore_recall": 0.8648278117179871, "bertscore_f1": 0.7920902371406555}}, "original": {"ref_free": {"completeness": 3, "conciseness": 8, "readability": 7, "faithfulness": 10}}}
+{"dataset_id": "ivbu-e2q7", "hs": {"ref_free": {"completeness": 8, "conciseness": 9, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.1600251572327044, "rouge1": 0.304, "rouge2": 0.06504065040650406, "rougeL": 0.17600000000000005, "bertscore_precision": 0.8909237384796143, "bertscore_recall": 0.8377439975738525, "bertscore_f1": 0.8635159134864807}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 10, "faithfulness": 10}, "similarity": {"meteor": 0.2670168467660061, "rouge1": 0.36123348017621143, "rouge2": 0.09777777777777777, "rougeL": 0.22026431718061673, "bertscore_precision": 0.8455288410186768, "bertscore_recall": 0.8624280691146851, "bertscore_f1": 0.8538948893547058}}, "sfd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.23159786220610287, "rouge1": 0.2279202279202279, "rouge2": 0.05730659025787965, "rougeL": 0.15384615384615385, "bertscore_precision": 0.7813979387283325, "bertscore_recall": 0.8413443565368652, "bertscore_f1": 0.8102638721466064}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2670168467660061, "rouge1": 0.36123348017621143, "rouge2": 0.09777777777777777, "rougeL": 0.22026431718061673, "bertscore_precision": 0.8455288410186768, "bertscore_recall": 0.8624280691146851, "bertscore_f1": 0.8538948893547058}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.23159786220610287, "rouge1": 0.2279202279202279, "rouge2": 0.05730659025787965, "rougeL": 0.15384615384615385, "bertscore_precision": 0.7813979387283325, "bertscore_recall": 0.8413443565368652, "bertscore_f1": 0.8102638721466064}}, "original": {"ref_free": {"completeness": 7, "conciseness": 6, "readability": 8, "faithfulness": 10}}}
+{"dataset_id": "4n2j-ut8i", "hs": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2528161428237416, "rouge1": 0.3137254901960784, "rouge2": 0.06, "rougeL": 0.2156862745098039, "bertscore_precision": 0.8548800349235535, "bertscore_recall": 0.856559693813324, "bertscore_f1": 0.8557190299034119}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.347783273381295, "rouge1": 0.3314285714285714, "rouge2": 0.12716763005780346, "rougeL": 0.22857142857142856, "bertscore_precision": 0.8433845043182373, "bertscore_recall": 0.8858885169029236, "bertscore_f1": 0.8641141057014465}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.25072063795756405, "rouge1": 0.20447284345047922, "rouge2": 0.057877813504823156, "rougeL": 0.134185303514377, "bertscore_precision": 0.7765292525291443, "bertscore_recall": 0.8672664165496826, "bertscore_f1": 0.8193934559822083}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.347783273381295, "rouge1": 0.3314285714285714, "rouge2": 0.12716763005780346, "rougeL": 0.22857142857142856, "bertscore_precision": 0.8433845043182373, "bertscore_recall": 0.8858885169029236, "bertscore_f1": 0.8641141057014465}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.25072063795756405, "rouge1": 0.20447284345047922, "rouge2": 0.057877813504823156, "rougeL": 0.134185303514377, "bertscore_precision": 0.7765292525291443, "bertscore_recall": 0.8672664165496826, "bertscore_f1": 0.8193934559822083}}, "original": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "ubuy-v2nw", "hs": {"ref_free": {"completeness": 7, "conciseness": 9, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.3835051546391753, "rouge1": 0.21428571428571427, "rouge2": 0.07692307692307691, "rougeL": 0.21428571428571427, "bertscore_precision": 0.8678452968597412, "bertscore_recall": 0.904793381690979, "bertscore_f1": 0.8859342932701111}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.3318584070796461, "rouge1": 0.10218978102189781, "rouge2": 0.08888888888888888, "rougeL": 0.10218978102189781, "bertscore_precision": 0.8085416555404663, "bertscore_recall": 0.9283502101898193, "bertscore_f1": 0.8643138408660889}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.1522513767411727, "rouge1": 0.05970149253731343, "rouge2": 0.030150753768844216, "rougeL": 0.04975124378109452, "bertscore_precision": 0.760970413684845, "bertscore_recall": 0.8769787549972534, "bertscore_f1": 0.8148663640022278}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.3318584070796461, "rouge1": 0.10218978102189781, "rouge2": 0.08888888888888888, "rougeL": 0.10218978102189781, "bertscore_precision": 0.8085416555404663, "bertscore_recall": 0.9283502101898193, "bertscore_f1": 0.8643138408660889}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.1522513767411727, "rouge1": 0.05970149253731343, "rouge2": 0.030150753768844216, "rougeL": 0.04975124378109452, "bertscore_precision": 0.760970413684845, "bertscore_recall": 0.8769787549972534, "bertscore_f1": 0.8148663640022278}}, "original": {"ref_free": {"completeness": 1, "conciseness": 1, "readability": 1, "faithfulness": 10}}}
+{"dataset_id": "evir-bydt", "hs": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.24822695035460993, "rouge1": 0.39215686274509803, "rouge2": 0.0, "rougeL": 0.27450980392156865, "bertscore_precision": 0.8859463930130005, "bertscore_recall": 0.8836898803710938, "bertscore_f1": 0.8848167061805725}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.2987466001912188, "rouge1": 0.23463687150837986, "rouge2": 0.0903954802259887, "rougeL": 0.1675977653631285, "bertscore_precision": 0.81339031457901, "bertscore_recall": 0.8934609293937683, "bertscore_f1": 0.8515475392341614}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.2576857670979668, "rouge1": 0.1732283464566929, "rouge2": 0.09523809523809525, "rougeL": 0.1259842519685039, "bertscore_precision": 0.7627044916152954, "bertscore_recall": 0.8748475909233093, "bertscore_f1": 0.8149362206459045}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.2987466001912188, "rouge1": 0.23463687150837986, "rouge2": 0.0903954802259887, "rougeL": 0.1675977653631285, "bertscore_precision": 0.81339031457901, "bertscore_recall": 0.8934609293937683, "bertscore_f1": 0.8515475392341614}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.2576857670979668, "rouge1": 0.1732283464566929, "rouge2": 0.09523809523809525, "rougeL": 0.1259842519685039, "bertscore_precision": 0.7627044916152954, "bertscore_recall": 0.8748475909233093, "bertscore_f1": 0.8149362206459045}}, "original": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "pxzj-y6s8", "hs": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.16528925619834708, "rouge1": 0.2857142857142857, "rouge2": 0.06741573033707865, "rougeL": 0.1978021978021978, "bertscore_precision": 0.8567256927490234, "bertscore_recall": 0.8146368265151978, "bertscore_f1": 0.8351513147354126}}, "ufd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.29613432674657164, "rouge1": 0.45783132530120485, "rouge2": 0.18292682926829268, "rougeL": 0.3132530120481928, "bertscore_precision": 0.8440583944320679, "bertscore_recall": 0.855178952217102, "bertscore_f1": 0.8495822548866272}}, "sfd": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.20804438280166437, "rouge1": 0.2285714285714286, "rouge2": 0.06474820143884892, "rougeL": 0.15714285714285714, "bertscore_precision": 0.7766103744506836, "bertscore_recall": 0.8252578973770142, "bertscore_f1": 0.8001953959465027}}, "ufd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.29613432674657164, "rouge1": 0.45783132530120485, "rouge2": 0.18292682926829268, "rougeL": 0.3132530120481928, "bertscore_precision": 0.8440583944320679, "bertscore_recall": 0.855178952217102, "bertscore_f1": 0.8495822548866272}}, "sfd_nyc": {"ref_free": {"completeness": 8, "conciseness": 7, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.20804438280166437, "rouge1": 0.2285714285714286, "rouge2": 0.06474820143884892, "rougeL": 0.15714285714285714, "bertscore_precision": 0.7766103744506836, "bertscore_recall": 0.8252578973770142, "bertscore_f1": 0.8001953959465027}}, "original": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}}}
+{"dataset_id": "43qn-d6r8", "hs": {"ref_free": {"completeness": 7, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.2563218390804598, "rouge1": 0.21739130434782605, "rouge2": 0.09090909090909091, "rougeL": 0.21739130434782605, "bertscore_precision": 0.8460445404052734, "bertscore_recall": 0.8455512523651123, "bertscore_f1": 0.8457977771759033}}, "ufd": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.16819571865443428, "rouge1": 0.16470588235294115, "rouge2": 0.09523809523809525, "rougeL": 0.1176470588235294, "bertscore_precision": 0.7827520966529846, "bertscore_recall": 0.8891653418540955, "bertscore_f1": 0.8325722813606262}}, "sfd": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.09433962264150945, "rouge1": 0.07365439093484419, "rouge2": 0.03988603988603988, "rougeL": 0.0623229461756374, "bertscore_precision": 0.7297126650810242, "bertscore_recall": 0.8699643015861511, "bertscore_f1": 0.7936902046203613}}, "ufd_nyc": {"ref_free": {"completeness": 9, "conciseness": 7, "readability": 8, "faithfulness": 10}, "similarity": {"meteor": 0.16819571865443428, "rouge1": 0.16470588235294115, "rouge2": 0.09523809523809525, "rougeL": 0.1176470588235294, "bertscore_precision": 0.7827520966529846, "bertscore_recall": 0.8891653418540955, "bertscore_f1": 0.8325722813606262}}, "sfd_nyc": {"ref_free": {"completeness": 9, "conciseness": 8, "readability": 9, "faithfulness": 10}, "similarity": {"meteor": 0.09433962264150945, "rouge1": 0.07365439093484419, "rouge2": 0.03988603988603988, "rougeL": 0.0623229461756374, "bertscore_precision": 0.7297126650810242, "bertscore_recall": 0.8699643015861511, "bertscore_f1": 0.7936902046203613}}, "original": {"ref_free": {"completeness": 5, "conciseness": 7, "readability": 8, "faithfulness": 10}}}
+</file>
+
+<file path="evaluation/text_eval.py">
+import json
+import os
+import nltk
+from nltk.tokenize import word_tokenize
+from nltk.translate.meteor_score import meteor_score
+from rouge_score import rouge_scorer
+from bert_score import score as bertscore
+from dotenv import load_dotenv
+import pandas as pd
+
+import google.generativeai as genai
+from google.generativeai import GenerativeModel
+
+# -----------------------
+# Init nltk & Gemini
+# -----------------------
+load_dotenv()
+API_KEY = os.getenv("GEMINI_API_KEY")
+genai.configure(api_key=API_KEY)
+MODEL_NAME = "gemini-2.0-flash"
+model = GenerativeModel(MODEL_NAME)
+
+# -----------------------
+# Prompts
+# -----------------------
+EVAL_PROMPT = """
+Evaluate the dataset description on (0–10):
+
+1. COMPLETENESS
+2. CONCISENESS
+3. READABILITY
+
+Return ONLY JSON:
+{"completeness": int, "conciseness": int, "readability": int}
+"""
+
+FAITH_PROMPT = """
+Evaluate FAITHFULNESS (0–10) of the description.
+
+A faithful description MUST only include information inferable from:
+1. SAMPLE
+2. CONTENT PROFILE
+3. SEMANTIC PROFILE
+
+Return ONLY JSON:
+{"faithfulness": int}
+"""
+
+# -----------------------
+# Gemini helpers
+# -----------------------
+def call_json(system_prompt, user_prompt):
+    raw = model.generate_content(
+        system_prompt + "\n\n" + user_prompt,
+        generation_config={"temperature": 0, "response_mime_type": "application/json"}
+    )
+    return json.loads(raw.text)
+
+# -----------------------
+# Text similarity
+# -----------------------
+def compute_similarity(reference, candidate):
+    if not reference or not candidate:
+        return {k: None for k in [
+            "meteor", "rouge1", "rouge2", "rougeL",
+            "bertscore_precision", "bertscore_recall", "bertscore_f1"
+        ]}
+
+    ref_tok = word_tokenize(reference)
+    cand_tok = word_tokenize(candidate)
+    meteor = meteor_score([ref_tok], cand_tok)
+
+    rouge = rouge_scorer.RougeScorer(
+        ["rouge1","rouge2","rougeL"], use_stemmer=True
+    ).score(reference, candidate)
+
+    P, R, F1 = bertscore([candidate], [reference], lang="en", verbose=False)
+
+    return {
+        "meteor": meteor,
+        "rouge1": rouge["rouge1"].fmeasure,
+        "rouge2": rouge["rouge2"].fmeasure,
+        "rougeL": rouge["rougeL"].fmeasure,
+        "bertscore_precision": float(P[0]),
+        "bertscore_recall": float(R[0]),
+        "bertscore_f1": float(F1[0]),
+    }
+
+
+# -----------------------
+# Load metadata original descriptions
+# -----------------------
+def load_original(metadata_path):
+    out = {}
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    for item in meta:
+        out[item["id"]] = item.get("description", "")
+    return out
+
+
+# -----------------------
+# MAIN EVALUATION with RESUME
+# -----------------------
+def evaluate_all(
+    baseline_jsonl,
+    metadata_path,
+    queries_txt,
+    relevance_csv,
+    output_jsonl
+):
+    # -------------------------------------
+    # Load existing results (Resume)
+    # -------------------------------------
+    done_ids = set()
+    if os.path.exists(output_jsonl):
+        print(f"[RESUME] Loading existing results from {output_jsonl}")
+        with open(output_jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                done_ids.add(rec["dataset_id"])
+        print(f"[RESUME] Found {len(done_ids)} completed datasets.")
+    else:
+        print("[RESUME] No existing results, starting fresh.")
+
+    # Open output file in append mode
+    fout = open(output_jsonl, "a", encoding="utf-8")
+
+    # -------------------------------------
+    # Load metadata original descriptions
+    # -------------------------------------
+    original_map = load_original(metadata_path)
+
+    # -------------------------------------
+    # Iterate baseline
+    # -------------------------------------
+    with open(baseline_jsonl, "r", encoding="utf-8") as fin:
+
+        for line in fin:
+            if not line.strip():
+                continue
+
+            rec = json.loads(line)
+            ds_id = rec["dataset_id"]
+
+            # Skip if already evaluated
+            if ds_id in done_ids:
+                #print(f"[SKIP] {ds_id} already processed.")
+                continue
+
+            print(f"=== Evaluating {ds_id} ===")
+
+            sample = rec.get("sample", "")
+            content = rec.get("content_profile", {})
+            semantic = rec.get("semantic_profile", {})
+
+            ufd = rec.get("ufd", "")
+            sfd = rec.get("sfd", "")
+            ufd_nyc = rec.get("ufd_nyc", "")
+            sfd_nyc = rec.get("sfd_nyc", "")
+            hs = rec.get("HandS", "")
+
+            original_desc = original_map.get(ds_id, "")
+
+            # --------------------
+            # Gemini ref-free eval
+            # --------------------
+            def eval_QA(text):
+                return call_json(EVAL_PROMPT, text)
+
+            def eval_faith(text):
+                MAX_CHARS = 50000
+                sample_trunc = sample[:MAX_CHARS]
+                content_trunc = json.dumps(content, indent=2)[:MAX_CHARS]
+                semantic_trunc = json.dumps(semantic, indent=2)[:MAX_CHARS]
+                block = (
+                    "SAMPLE:\n" + sample_trunc + "\n\n" +
+                    "CONTENT:\n" + content_trunc + "\n\n" +
+                    "SEMANTIC:\n" + semantic_trunc + "\n\n" +
+                    "DESC:\n" + text
+                )
+                return call_json(FAITH_PROMPT, block).get("faithfulness", None)
+
+            def build_ref_free(desc):
+                out = eval_QA(desc)
+                out["faithfulness"] = eval_faith(desc)
+                return out
+
+            # Might raise API error → resume protects us
+            try:
+                rf_hs = build_ref_free(hs)
+                rf_ufd = build_ref_free(ufd)
+                rf_sfd = build_ref_free(sfd)
+                rf_ufd_nyc = build_ref_free(ufd_nyc)
+                rf_sfd_nyc = build_ref_free(sfd_nyc)
+                rf_original = build_ref_free(original_desc) if original_desc else {}
+            except Exception as e:
+                print(f"[ERROR] LLM failed on {ds_id}: {e}")
+                print("[HINT] Resume will pick up from here next run.")
+                fout.close()
+                raise e
+
+            # --------------------
+            # Similarity
+            # --------------------
+            sim_hs = compute_similarity(original_desc, hs)
+            sim_ufd = compute_similarity(original_desc, ufd)
+            sim_sfd = compute_similarity(original_desc, sfd)
+            sim_ufd_nyc = compute_similarity(original_desc, ufd_nyc)
+            sim_sfd_nyc = compute_similarity(original_desc, sfd_nyc)
+
+            # --------------------
+            # WRITE RESULT
+            # --------------------
+            out = {
+                "dataset_id": ds_id,
+                "hs": {"ref_free": rf_hs, "similarity": sim_hs},
+                "ufd": {"ref_free": rf_ufd, "similarity": sim_ufd},
+                "sfd": {"ref_free": rf_sfd, "similarity": sim_sfd},
+                "ufd_nyc": {"ref_free": rf_ufd_nyc, "similarity": sim_ufd_nyc},
+                "sfd_nyc": {"ref_free": rf_sfd_nyc, "similarity": sim_sfd_nyc},
+                "original": {"ref_free": rf_original},
+            }
+
+            fout.write(json.dumps(out) + "\n")
+            fout.flush()
+
+            print(f"[DONE] {ds_id}")
+
+    fout.close()
+    print("Saved →", output_jsonl)
+
+
+# -----------------------
+# CLI
+# -----------------------
+if __name__ == "__main__":
+    evaluate_all(
+        baseline_jsonl="../../outputs/baseline_autoddg_descriptions.jsonl",
+        metadata_path="../../outputs/metadata_registry.json",
+        queries_txt="queries.txt",
+        relevance_csv="relevance_matrix.csv",
+        output_jsonl="text_eval_results.jsonl"
+    )
+</file>
+
+<file path="pipeline_test.py">
+"""
+File: src/pipeline_test.py
+Description: 
+    This script executes an end-to-end test of the data processing pipeline.
+    It performs two main steps:
+    1. Connects to the NYC Open Data (Socrata) API to fetch a sample dataset.
+    2. Sends a data preview to the Google Gemini API to verify description generation.
+    
+    Usage: python src/pipeline_test.py
+"""
+
+import os
+import pandas as pd
+from sodapy import Socrata
+from dotenv import load_dotenv
+import google.generativeai as genai
+
+# 1. Load environment variables
+load_dotenv()
+SOCRATA_TOKEN = os.getenv("SOCRATA_APP_TOKEN")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+
+# Check if Keys exist
+if not SOCRATA_TOKEN or not GEMINI_KEY:
+    print("Error: Missing Token or Key in .env file, please check!")
+    exit()
+
+# 2. Configure Gemini AI
+print("Configuring Gemini AI...")
+genai.configure(api_key=GEMINI_KEY)
+# Using the latest flash model which we confirmed is available
+model = genai.GenerativeModel('gemini-2.0-flash')
+
+def run_test_pipeline():
+    print("-" * 40)
+    print("Starting End-to-End Pipeline Test")
+    print("-" * 40)
+
+    # --- Stage 1: Download data from NYC Open Data ---
+    print("\nStage 1: Downloading data from Socrata...")
+    client = Socrata("data.cityofnewyork.us", SOCRATA_TOKEN)
+    
+    # We select an interesting dataset: "Central Park Squirrel Census"
+    # ID: vfnx-vebw
+    dataset_id = "vfnx-vebw" 
+    
+    try:
+        # Get Metadata
+        metadata = client.get_metadata(dataset_id)
+        dataset_name = metadata['name']
+        print(f"   -> Found dataset: {dataset_name}")
+        
+        # Download data (Download only first 5 rows for testing)
+        results = client.get(dataset_id, limit=5)
+        df = pd.DataFrame.from_records(results)
+        
+        # Convert to string format, ready to feed to AI
+        # Send only column names and first 3 rows to save tokens
+        data_preview = df.head(3).to_markdown(index=False)
+        print(f"   -> Data downloaded successfully! Column count: {len(df.columns)}")
+        
+    except Exception as e:
+        print(f"Stage 1 failed: {e}")
+        return
+
+    # --- Stage 2: Generate description using Gemini ---
+    print("\nStage 2: Sending to Gemini for description generation...")
+    
+    # Construct Prompt
+    prompt = f"""
+    You are a data analyst. I will give you a sample of a dataset from NYC Open Data.
+    
+    Dataset Name: {dataset_name}
+    
+    Data Sample:
+    {data_preview}
+    
+    Task: Write a 2-sentence description of what this dataset appears to be about.
+    """
+    
+    try:
+        # Call API
+        response = model.generate_content(prompt)
+        
+        print("\n Gemini Generated Description:")
+        print("=" * 40)
+        print(response.text)
+        print("=" * 40)
+        print("\n Test Success! Your pipeline is working!")
+        
+    except Exception as e:
+        print(f" Stage 2 failed: {e}")
+
+if __name__ == "__main__":
+    run_test_pipeline()
+</file>
+
+<file path="README.md">
+# Contents
+
+## Week 1
+
+- `data_collector.py` - Bulk downloader. Collects NYC Open Data datasets (tabular only), saves
+  CSV samples, and builds the metadata registry.
+- `download_from_registry.py` - Team sync tool. Restores missing CSV files using the shared
+  `metadata_registry.json`.
+- `pipeline_test.py`- End-to-end test to verify Socrata + Gemini APIs.
+- `check_models.py`- Lists Gemini models available to your API key.
+- `metadata_registry.json`: Shared dataset registry created in Week 1.
+
+## Week 2
+
+Baseline AutoDDG implementation.
+
+- `baseline/profiling_autoddg.py` - Generates Content Summaries (non-LLM): column types, null ratios, unique counts, stats, sample values.
+- `baseline/semantic_autoddg.py` - Generates Semantic Summaries (LLM): temporal/spatial detection, entity types, usage roles. Includes column filtering to reduce Gemini quota usage.
+- `baseline/descriptions_autoddg.py` - Produces UFD (User-Focused Description) and SFD (Search-Focused Description).
+- `baseline/llm_client.py` - Central Gemini client with the gemini-2.0-flash model.
+- `baseline_autoddg.py` - Main Baseline AutoDDG runner. Loads each dataset, builds summaries, generates UFD+SFD, and writes results to:
+  - `data/0_baseline_autoddg_descriptions.jsonl`
+  - `data/0_baseline_autoddg_runtime.jsonl`
+
+Supports resume (skips completed datasets) and stops on quota errors.
+
+### Run baseline AutoDDG
+
+```
+python src/baseline_autoddg.py
+```
+</file>
+
+</files>
