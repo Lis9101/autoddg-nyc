@@ -27,7 +27,8 @@ from baseline.llm_client import call_llm
 # ================================================================
 BASE_DIR = src_dir.parent
 METADATA_PATH = BASE_DIR / "outputs" / "metadata_registry.json"
-BASELINE_PATH = BASE_DIR / "outputs" / "baseline_autoddg_descriptions.jsonl"
+BASELINE_PATH = BASE_DIR / "outputs" / "0_baseline_autoddg_descriptions.jsonl"
+NYC_PATH = BASE_DIR / "outputs" / "stage2_async_nyc_descriptions.jsonl"
 OUTPUT_JSON_PATH = BASE_DIR / "outputs" / "text_eval_results.json"
 
 
@@ -74,10 +75,10 @@ def extract_json(text):
 # ================================================================
 def run_text_evaluation(limit=10):
     print("-" * 60)
-    print(" Running Text Quality Evaluation (Including Original)")
+    print(" Running Text Quality Evaluation (Original + Baseline + NYC)")
     print("-" * 60)
 
-    # 1. Load Data
+    # 1. Load metadata (original / H&S)
     if not METADATA_PATH.exists():
         print(f"[ERROR] Metadata not found at {METADATA_PATH}")
         return
@@ -85,30 +86,67 @@ def run_text_evaluation(limit=10):
         metadata = json.load(f)
     meta_map = {item["id"]: item for item in metadata}
 
+    # 2. Load baseline AutoDDG descriptions (ufd, sfd)
     if not BASELINE_PATH.exists():
-        print(f"[ERROR] Descriptions not found at {BASELINE_PATH}")
+        print(f"[ERROR] Baseline descriptions not found at {BASELINE_PATH}")
         return
-    
-    records = []
+
+    baseline_records = []
     with open(BASELINE_PATH, "r", encoding="utf-8") as f:
         for line in f:
             if line.strip():
-                records.append(json.loads(line))
-    
-    # [UPDATED] Add 'original' to the evaluation list
-    methods = ["original", "HandS", "ufd", "ufd_nyc"] 
-    scores = {m: {"readability": [], "faithfulness": [], "completeness": [], "conciseness": []} for m in methods}
+                baseline_records.append(json.loads(line))
+    baseline_map = {rec["dataset_id"]: rec for rec in baseline_records}
 
-    # Limit processing
-    processing_records = records[:limit]
-    
+    # 3. Load NYC AutoDDG descriptions (ufd_nyc, sfd_nyc)
+    if not NYC_PATH.exists():
+        print(f"[WARN] NYC descriptions not found at {NYC_PATH} - NYC methods will be skipped.")
+        nyc_map = {}
+    else:
+        nyc_records = []
+        with open(NYC_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    nyc_records.append(json.loads(line))
+        nyc_map = {rec["dataset_id"]: rec for rec in nyc_records}
+
+    # 4. Methods to evaluate
+    methods = ["original", "ufd", "sfd", "ufd_nyc", "sfd_nyc"]
+    scores = {
+        m: {
+            "readability": [],
+            "faithfulness": [],
+            "completeness": [],
+            "conciseness": [],
+        }
+        for m in methods
+    }
+
+    def get_description(ds_id: str, method: str) -> str:
+        # Original human-written description from metadata (H&S)
+        if method == "original":
+            return meta_map.get(ds_id, {}).get("description", "")
+
+        # Baseline AutoDDG descriptions
+        if method in ("ufd", "sfd"):
+            return baseline_map.get(ds_id, {}).get(method, "")
+
+        # NYC AutoDDG descriptions
+        if method in ("ufd_nyc", "sfd_nyc"):
+            return nyc_map.get(ds_id, {}).get(method, "")
+
+        return ""
+
+    # Limit which datasets we evaluate based on the baseline list
+    processing_records = baseline_records[:limit]
+
     print(f"[INFO] Evaluating {len(processing_records)} datasets (x {len(methods)} methods each)...")
 
     for i, rec in enumerate(processing_records):
         ds_id = rec["dataset_id"]
         meta = meta_map.get(ds_id, {})
         title = meta.get("name", "Unknown")
-        
+
         # Robust column parsing
         raw_cols = meta.get("columns", [])
         col_list = []
@@ -122,14 +160,8 @@ def run_text_evaluation(limit=10):
         print(f" [{i+1}/{len(processing_records)}] Evaluating {ds_id}...")
 
         for method in methods:
-            # [UPDATED] Logic to fetch text
-            if method == "original":
-                # Fetch original description from metadata
-                desc_text = meta.get("description", "")
-            else:
-                # Fetch generated description from JSONL record
-                desc_text = rec.get(method, "")
-            
+            desc_text = get_description(ds_id, method)
+
             # Skip empty descriptions
             if not desc_text or len(desc_text) < 5:
                 continue
@@ -137,34 +169,32 @@ def run_text_evaluation(limit=10):
             prompt = EVAL_PROMPT_TEMPLATE.format(
                 title=title,
                 columns=cols,
-                description=desc_text
+                description=desc_text,
             )
-            
+
             try:
                 # Call LLM
                 resp = call_llm(prompt, temperature=0.0)
                 rating = extract_json(resp)
-                
+
                 if rating:
                     for key in scores[method]:
-                        val = rating.get(key, 3) 
+                        val = rating.get(key, 3)
                         scores[method][key].append(val)
                 else:
-                    # print(f"   [WARN] Failed to parse JSON for {method}")
                     pass
-            
+
             except Exception as e:
                 print(f"   [ERROR] LLM call failed for {method}: {e}")
-            
-            # Brief sleep
+
             time.sleep(0.5)
 
-    # 3. Aggregate
+    # 5. Aggregate
     final_results = {}
-    print("\n" + "="*30)
+    print("\n" + "=" * 30)
     print(" FINAL TEXT SCORES (Average)")
-    print("="*30)
-    
+    print("=" * 30)
+
     for m in methods:
         final_results[m] = {}
         print(f" Method: {m}")
@@ -176,7 +206,7 @@ def run_text_evaluation(limit=10):
             final_results[m][metric] = avg
             print(f"   - {metric:12s}: {avg:.2f}")
 
-    # 4. Save
+    # 6. Save
     OUTPUT_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(OUTPUT_JSON_PATH, "w", encoding="utf-8") as f:
         json.dump(final_results, f, indent=2)

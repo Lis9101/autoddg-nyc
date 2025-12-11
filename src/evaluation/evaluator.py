@@ -58,9 +58,10 @@ def make_radar_chart(ndcg_data, text_data):
     # Define methods to plot
     methods_to_plot = {
         "original": {"label": "Original",   "color": "blue",   "style": "dotted"},
-        "hs":       {"label": "H&S",        "color": "orange", "style": "dashed"},
         "ufd":      {"label": "UFD",        "color": "green",  "style": "solid"},
-        "ufd_nyc":  {"label": "UFD-NYC",    "color": "red",    "style": "solid"}
+        "sfd":      {"label": "SFD",        "color": "purple", "style": "dashdot"},
+        "ufd_nyc":  {"label": "UFD-NYC",    "color": "red",    "style": "solid"},
+        "sfd_nyc":  {"label": "SFD-NYC",    "color": "brown",  "style": "dashdot"},
     }
 
     # Helper to handle "hs" vs "HandS" mismatch

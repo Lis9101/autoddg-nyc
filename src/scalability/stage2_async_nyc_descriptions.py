@@ -372,7 +372,7 @@ def main():
     parser.add_argument(
         "--concurrency",
         type=int,
-        default=5,
+        default=10,
         help="Max number of datasets processed concurrently.",
     )
     args = parser.parse_args()
