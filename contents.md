@@ -3,12 +3,12 @@
 
 All scripts are included in the `src/` folder, all generated output are saved to the `output/` folder, the `data/` folder contains the result from week 1 & 2 (baseline AutoDDG generation).
 
-The `/baseline` folder contains the code for building the baseline AutoDDG. `descriptions_nyc.py` in this folder contains the the new nyc-specific prompts for the LLM.  Read [whatshere.md](src\baseline\whatshere.md) in this folder for details.
+The `/baseline` folder contains the code for building the baseline AutoDDG. `descriptions_nyc.py` in this folder contains the the new nyc-specific prompts for the LLM.  Read [whatshere.md](src/baseline/whatshere.md) in this folder for details.
 
 
-The `/evaluation` folder contains the code for evaluation. Read [evaluation.txt](src\evaluation\evaluation.txt) in this folder for details.
+The `/evaluation` folder contains the code for evaluation. Read [evaluation.txt](src/evaluation/evaluation.txt) in this folder for details.
 
-The `/scalability` folder contains the code for building the scalability pipeline. Read [scalability.md](src\scalability\scalability.md) in this folder for more details.
+The `/scalability` folder contains the code for building the scalability pipeline. Read [scalability.md](src/scalability/scalability.md) in this folder for more details.
 
 ---
 
